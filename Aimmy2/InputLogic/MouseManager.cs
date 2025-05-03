@@ -26,52 +26,28 @@ namespace Aimmy2.InputLogic
 
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
-
         private static Random MouseRandom = new();
 
-        /// <summary>
-        /// Interpolates a point along a cubic Bézier curve and (optionally) smooths it
-        /// with an Exponential?Moving?Average to tame micro?jitter.
-        /// </summary>
-        private static Point CubicBezier(Point start,
-                                         Point end,
-                                         Point control1,
-                                         Point control2,
-                                         double t)
+        private static Point CubicBezier(Point start, Point end, Point control1, Point control2, double t)
         {
-            // ??? 1. Bézier interpolation ???????????????????????????????????????????????
             double u = 1 - t;
             double tt = t * t;
             double uu = u * u;
             double uuu = uu * u;
             double ttt = tt * t;
 
-            double x = uuu * start.X
-                     + 3 * uu * t * control1.X
-                     + 3 * u * tt * control2.X
-                     + ttt * end.X;
+            double x = uuu * start.X + 3 * uu * t * control1.X + 3 * u * tt * control2.X + ttt * end.X;
+            double y = uuu * start.Y + 3 * uu * t * control1.Y + 3 * u * tt * control2.Y + ttt * end.Y;
 
-            double y = uuu * start.Y
-                     + 3 * uu * t * control1.Y
-                     + 3 * u * tt * control2.Y
-                     + ttt * end.Y;
-
-            // ??? 2. Optional EMA smoothing ?????????????????????????????????????????????
             if (IsEMASmoothingEnabled)
             {
-                // keep factor in a sane [0.05?0.95] band
-                double sf = Math.Clamp(smoothingFactor, 0.05, 0.95);
-
-                x = EmaSmoothing(previousX, x, sf);
-                y = EmaSmoothing(previousY, y, sf);
+                x = EmaSmoothing(previousX, x, smoothingFactor);
+                y = EmaSmoothing(previousY, y, smoothingFactor);
             }
-
-            // ??? 3. Update history so the next call has the right “previous” value ????
-            previousX = x;
-            previousY = y;
 
             return new Point((int)x, (int)y);
         }
+
 
 
         private static double EmaSmoothing(double previousValue, double currentValue, double smoothingFactor) => currentValue * smoothingFactor + previousValue * (1 - smoothingFactor);
