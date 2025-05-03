@@ -563,6 +563,26 @@ namespace Aimmy2
 
             uiManager.S_EMASmoothing = AddSlider(AimConfig, "EMA Smoothening", "Amount", 0.01, 0.01, 0.01, 1);
 
+            uiManager.S_BezierStrength = AddSlider(
+             AimConfig,
+             "Bezier Strength",
+             "% Curve",
+             1,    // tick every 1%
+             1,    // arrow-button step
+             0,    // min
+             100   // max
+         );
+
+            uiManager.S_BezierSteps = AddSlider(
+                AimConfig,
+                "Bezier Steps",
+                "Steps",
+                1,    // tick every 1 step
+                1,    // arrow-button step
+                1,    // min 1
+                50    // max 50
+            );
+
             AddSeparator(AimConfig);
 
             #endregion Config
@@ -677,6 +697,7 @@ namespace Aimmy2
             uiManager.D_ExecutionProvider = AddDropdown(SettingsConfig, "Execution Provider Type");
             uiManager.DDI_CUDA = AddDropdownItem(uiManager.D_ExecutionProvider, "CUDA");
             uiManager.DDI_TensorRT = AddDropdownItem(uiManager.D_ExecutionProvider, "TensorRT");
+
 
 
 

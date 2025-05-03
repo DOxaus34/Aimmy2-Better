@@ -34,6 +34,12 @@ namespace Aimmy2.AILogic
         private List<string>? _outputNames;
         private RectangleF LastDetectionBox;
 
+        // Preallocate once for IMAGE_SIZE×IMAGE_SIZE RGB input
+        private readonly float[] _inputBuffer = new float[3 * IMAGE_SIZE * IMAGE_SIZE];
+        private readonly DenseTensor<float> _inputTensor;
+        private readonly List<NamedOnnxValue> _inputContainer;
+
+
         private ID3D11Device _device;
         private ID3D11DeviceContext _context;
         private IDXGIOutputDuplication _outputDuplication;
@@ -81,6 +87,11 @@ namespace Aimmy2.AILogic
                 ExecutionMode = ExecutionMode.ORT_PARALLEL,
                 IntraOpNumThreads = Environment.ProcessorCount
             };
+            _inputTensor = new DenseTensor<float>(_inputBuffer, new[] { 1, 3, IMAGE_SIZE, IMAGE_SIZE });
+            _inputContainer = new List<NamedOnnxValue>
+    {
+        NamedOnnxValue.CreateFromTensor("images", _inputTensor)
+    };
 
             SystemEvents.DisplaySettingsChanged += (s, e) =>
             {
@@ -271,13 +282,15 @@ namespace Aimmy2.AILogic
             }
 
             // Begin the loop
+            // Begin the loop
             _isAiLoopRunning = true;
-            _aiLoopThread = new Thread(AiLoop)
-            {
-                IsBackground = true,
-                Priority = ThreadPriority.AboveNormal
-            };
+            _aiLoopThread = new Thread(AiLoop);
+            // ↓ ensure COM-based backends (LG HUB, etc.) work without crashing:
+            _aiLoopThread.SetApartmentState(ApartmentState.STA);
+            _aiLoopThread.IsBackground = true;
+            _aiLoopThread.Priority = ThreadPriority.AboveNormal;
             _aiLoopThread.Start();
+
 
             return Task.CompletedTask;
         }
@@ -489,49 +502,60 @@ namespace Aimmy2.AILogic
         }
         #endregion
         #region Coordinates
-        private void CalculateCoordinates(DetectedPlayerWindow DetectedPlayerOverlay, Prediction closestPrediction, float scaleX, float scaleY)
+        private void CalculateCoordinates(DetectedPlayerWindow detectedPlayerOverlay, Prediction closestPrediction, float scaleX, float scaleY)
         {
+            // Store latest confidence
             AIConf = closestPrediction.Confidence;
 
+            // If ESP is on, update the overlay—but bail out if Aim Assist is off
             if (Dictionary.toggleState["Show Detected Player"] && Dictionary.DetectedPlayerOverlay != null)
             {
-                UpdateOverlay(DetectedPlayerOverlay);
-                if (!Dictionary.toggleState["Aim Assist"]) return;
+                UpdateOverlay(detectedPlayerOverlay);
+                if (!Dictionary.toggleState["Aim Assist"])
+                    return;
             }
 
-
-            double YOffset = Dictionary.sliderSettings["Y Offset (Up/Down)"];
-            double XOffset = Dictionary.sliderSettings["X Offset (Left/Right)"];
-            double YOffsetPercentage = Dictionary.sliderSettings["Y Offset (%)"];
-            double XOffsetPercentage = Dictionary.sliderSettings["X Offset (%)"];
-
+            // The model’s Rectangle is already in absolute screen pixels
             var rect = closestPrediction.Rectangle;
-            double rectX = rect.X;
-            double rectY = rect.Y;
-            double rectWidth = rect.Width;
-            double rectHeight = rect.Height;
 
-            detectedX = Dictionary.toggleState["X Axis Percentage Adjustment"]
-                ? (int)((rectX + (rectWidth * (XOffsetPercentage / 100))) * scaleX)
-                : (int)((rectX + rectWidth / 2) * scaleX + XOffset);
+            // Read user‐configured offsets
+            double xOffset = Dictionary.sliderSettings["X Offset (Left/Right)"];
+            double yOffset = Dictionary.sliderSettings["Y Offset (Up/Down)"];
+            double xOffsetPercent = Dictionary.sliderSettings["X Offset (%)"];
+            double yOffsetPercent = Dictionary.sliderSettings["Y Offset (%)"];
 
-            detectedY = Dictionary.toggleState["Y Axis Percentage Adjustment"]
-                ? (int)((rectY + rectHeight - (rectHeight * (YOffsetPercentage / 100))) * scaleY + YOffset)
-                : CalculateDetectedY(scaleY, YOffset, closestPrediction);
-        }
-        private static int CalculateDetectedY(float scaleY, double YOffset, Prediction closestPrediction)
-        {
-            var rect = closestPrediction.Rectangle;
-            float yBase = rect.Y;
-            float yAdjustment = Dictionary.dropdownState["Aiming Boundaries Alignment"] switch
+            // Compute the target X in screen pixels
+            double x;
+            if (Dictionary.toggleState["X Axis Percentage Adjustment"])
+                x = rect.X + rect.Width * (xOffsetPercent / 100.0) + xOffset;
+            else
+                x = rect.X + rect.Width / 2.0 + xOffset;
+
+            // Compute the target Y in screen pixels
+            double y;
+            if (Dictionary.toggleState["Y Axis Percentage Adjustment"])
             {
-                "Center" => rect.Height / 2,
-                "Bottom" => rect.Height,
-                _ => 0 // Default case for "Top" and any other unexpected values
-            };
+                // From bottom of box up by a percentage
+                y = rect.Y + rect.Height - rect.Height * (yOffsetPercent / 100.0) + yOffset;
+            }
+            else
+            {
+                // Anchor at Top, Center, or Bottom of the box
+                string alignment = Dictionary.dropdownState["Aiming Boundaries Alignment"];
+                double anchorFraction = alignment switch
+                {
+                    "Center" => 0.5,
+                    "Bottom" => 1.0,
+                    _ => 0.0   // “Top” or any other value
+                };
+                y = rect.Y + rect.Height * anchorFraction + yOffset;
+            }
 
-            return (int)((yBase + yAdjustment) * scaleY + YOffset);
+            // Round to integer mouse‐move targets
+            detectedX = (int)Math.Round(x);
+            detectedY = (int)Math.Round(y);
         }
+
         #endregion
         #region Mouse Movement
         private void HandleAim(Prediction closestPrediction)
@@ -559,116 +583,111 @@ namespace Aimmy2.AILogic
         }
         private Task<Prediction?> GetClosestPrediction(bool useMousePosition = true)
         {
-            var cursorPosition = WinAPICaller.GetCursorPosition();
+            var cursor = WinAPICaller.GetCursorPosition();
+            targetX = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse"
+                ? cursor.X
+                : ScreenWidth / 2;
+            targetY = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse"
+                ? cursor.Y
+                : ScreenHeight / 2;
 
-            targetX = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse" ? cursorPosition.X : ScreenWidth / 2;
-            targetY = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse" ? cursorPosition.Y : ScreenHeight / 2;
+            var box = new Rectangle(
+                targetX - IMAGE_SIZE / 2,
+                targetY - IMAGE_SIZE / 2,
+                IMAGE_SIZE,
+                IMAGE_SIZE
+            );
+            box = ClampRectangle(box, ScreenWidth, ScreenHeight);
 
-            Rectangle detectionBox = new(targetX - IMAGE_SIZE / 2, targetY - IMAGE_SIZE / 2, IMAGE_SIZE, IMAGE_SIZE);
-
-            detectionBox = ClampRectangle(detectionBox, ScreenWidth, ScreenHeight);
-
-            Bitmap? frame = ScreenGrab(detectionBox);
-            if (frame == null) return Task.FromResult<Prediction?>(null);
-
-            float[] inputArray = BitmapToFloatArray(frame);
-            if (inputArray == null) return Task.FromResult<Prediction?>(null);
-
-            Tensor<float> inputTensor = new DenseTensor<float>(inputArray, [1, 3, frame.Height, frame.Width]);
-            var inputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("images", inputTensor) };
-            if (_onnxModel == null) return Task.FromResult<Prediction?>(null);
-
-            using var results = _onnxModel.Run(inputs, _outputNames, _modeloptions);
-            var outputTensor = results[0].AsTensor<float>();
-
-            // Calculate the FOV boundaries
-            float FovSize = (float)Dictionary.sliderSettings["FOV Size"];
-            float fovMinX = (IMAGE_SIZE - FovSize) / 2.0f;
-            float fovMaxX = (IMAGE_SIZE + FovSize) / 2.0f;
-            float fovMinY = (IMAGE_SIZE - FovSize) / 2.0f;
-            float fovMaxY = (IMAGE_SIZE + FovSize) / 2.0f;
-
-            var (KDpoints, KDPredictions) = PrepareKDTreeData(outputTensor, detectionBox, fovMinX, fovMaxX, fovMinY, fovMaxY);
-
-            if (KDpoints.Count == 0 || KDPredictions.Count == 0)
-            {
-                if (Dictionary.toggleState["Collect Data While Playing"] && !Dictionary.toggleState["Constant AI Tracking"] && !Dictionary.toggleState["Auto Label Data"])
-                {
-                    SaveFrame(frame);
-                } // Save images if the user wants to even if theres nothing detected
+            var frame = ScreenGrab(box);
+            if (frame == null || _onnxModel == null)
                 return Task.FromResult<Prediction?>(null);
-            }
 
-            var tree = new KDTree<double, Prediction>(2, KDpoints.ToArray(), KDPredictions.ToArray(), L2Norm_Squared_Double);
-            var nearest = tree.NearestNeighbors([IMAGE_SIZE / 2.0, IMAGE_SIZE / 2.0], 1);
+            // Fill preallocated buffer in-place
+            BitmapToFloatArray(frame, _inputBuffer);
 
-            if (nearest != null && nearest.Length > 0)
+            // Run inference with the single reusable input container
+            using var results = _onnxModel.Run(_inputContainer, _outputNames, _modeloptions);
+            var output = results[0].AsTensor<float>();
+
+            // Compute FOV bounds
+            float fovSize = (float)Dictionary.sliderSettings["FOV Size"];
+            float half = (IMAGE_SIZE - fovSize) / 2;
+            float fovMinX = half, fovMaxX = half + fovSize;
+            float fovMinY = half, fovMaxY = half + fovSize;
+
+            // Filter & gather centers
+            var (pts, preds) = PrepareKDTreeData(output, box, fovMinX, fovMaxX, fovMinY, fovMaxY);
+            if (pts.Count == 0)
+                return Task.FromResult<Prediction?>(null);
+
+            // Linear nearest-neighbor
+            double center = IMAGE_SIZE / 2.0;
+            Prediction best = null!;
+            double bestDist = double.MaxValue;
+            for (int i = 0; i < pts.Count; i++)
             {
-                // Translate coordinates
-                var nearestPrediction = nearest[0].Item2;
-                float translatedXMin = nearestPrediction.Rectangle.X + detectionBox.Left;
-                float translatedYMin = nearestPrediction.Rectangle.Y + detectionBox.Top;
-                LastDetectionBox = new RectangleF(translatedXMin, translatedYMin, nearestPrediction.Rectangle.Width, nearestPrediction.Rectangle.Height);
-
-                CenterXTranslated = nearestPrediction.CenterXTranslated;
-                CenterYTranslated = nearestPrediction.CenterYTranslated;
-
-                SaveFrame(frame, nearestPrediction);
-
-                return Task.FromResult<Prediction?>(nearestPrediction);
-            }
-            return Task.FromResult<Prediction?>(null);
-        }
-
-        private static (List<double[]>, List<Prediction>) PrepareKDTreeData(Tensor<float> outputTensor, Rectangle detectionBox, float fovMinX, float fovMaxX, float fovMinY, float fovMaxY)
-        {
-            float minConfidence = (float)Dictionary.sliderSettings["AI Minimum Confidence"] / 100.0f;
-
-            var KDpoints = new List<double[]>();
-            var KDpredictions = new List<Prediction>();
-
-            Parallel.For(0, NUM_DETECTIONS, () => (new List<double[]>(), new List<Prediction>()), (i, loopState, localData) =>
-            {
-                float objectness = outputTensor[0, 4, i];
-                if (objectness < minConfidence) return localData;
-
-                float x_center = outputTensor[0, 0, i];
-                float y_center = outputTensor[0, 1, i];
-                float width = outputTensor[0, 2, i];
-                float height = outputTensor[0, 3, i];
-
-                float x_min = x_center - width / 2;
-                float y_min = y_center - height / 2;
-                float x_max = x_center + width / 2;
-                float y_max = y_center + height / 2;
-
-                if (x_min < fovMinX || x_max > fovMaxX || y_min < fovMinY || y_max > fovMaxY) return localData;
-
-                var rect = new RectangleF(x_min, y_min, width, height);
-                var prediction = new Prediction
+                double dx = pts[i][0] - center;
+                double dy = pts[i][1] - center;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < bestDist)
                 {
-                    Rectangle = rect,
-                    Confidence = objectness,
-                    CenterXTranslated = (x_center - detectionBox.Left) / IMAGE_SIZE,
-                    CenterYTranslated = (y_center - detectionBox.Top) / IMAGE_SIZE
-                };
-
-                localData.Item1.Add([x_center, y_center]);
-                localData.Item2.Add(prediction);
-
-                return localData;
-            },
-            localData =>
-            {
-                lock (KDpoints)
-                {
-                    KDpoints.AddRange(localData.Item1);
-                    KDpredictions.AddRange(localData.Item2);
+                    bestDist = d2;
+                    best = preds[i];
                 }
-            });
+            }
 
-            return (KDpoints, KDpredictions);
+            // Translate to screen coords and return
+            best.Rectangle = new RectangleF(
+                best.Rectangle.X + box.Left,
+                best.Rectangle.Y + box.Top,
+                best.Rectangle.Width,
+                best.Rectangle.Height
+            );
+            return Task.FromResult<Prediction?>(best);
         }
+
+
+        private static (List<double[]> points, List<Prediction> preds)
+    PrepareKDTreeData(
+        Tensor<float> output,
+        Rectangle detectionBox,
+        float fovMinX, float fovMaxX,
+        float fovMinY, float fovMaxY)
+        {
+            float minConf = (float)Dictionary.sliderSettings["AI Minimum Confidence"] / 100f;
+            var points = new List<double[]>(NUM_DETECTIONS);
+            var preds = new List<Prediction>(NUM_DETECTIONS);
+
+            for (int i = 0; i < NUM_DETECTIONS; i++)
+            {
+                float conf = output[0, 4, i];
+                if (conf < minConf) continue;
+
+                float xC = output[0, 0, i], yC = output[0, 1, i];
+                float w = output[0, 2, i], h = output[0, 3, i];
+
+                float xMin = xC - w / 2, xMax = xC + w / 2;
+                float yMin = yC - h / 2, yMax = yC + h / 2;
+                if (xMin < fovMinX || xMax > fovMaxX ||
+                    yMin < fovMinY || yMax > fovMaxY)
+                    continue;
+
+                // <-- FIX: explicitly create a double[] so it matches List<double[]>
+                points.Add(new double[] { xC, yC });
+
+                preds.Add(new Prediction
+                {
+                    Rectangle = new RectangleF(xMin, yMin, w, h),
+                    Confidence = conf,
+                    CenterXTranslated = (xC - detectionBox.Left) / IMAGE_SIZE,
+                    CenterYTranslated = (yC - detectionBox.Top) / IMAGE_SIZE
+                });
+            }
+
+            return (points, preds);
+        }
+
         #endregion
         #endregion AI Loop Functions
 
@@ -698,19 +717,16 @@ namespace Aimmy2.AILogic
         {
             try
             {
-                if (_device == null || _context == null | _outputDuplication == null)
+                if (_device == null || _context == null || _outputDuplication == null)
                 {
                     FileManager.LogError("Device, context, or textures are null, attempting to reinitialize");
                     ReinitializeD3D11();
 
                     if (_device == null || _context == null || _outputDuplication == null)
-                    {
                         throw new InvalidOperationException("Device, context, or textures are still null after reinitialization.");
-                    }
                 }
 
                 var result = _outputDuplication!.AcquireNextFrame(500, out var frameInfo, out var desktopResource);
-
                 if (result != Result.Ok)
                 {
                     _outputDuplication.ReleaseFrame();
@@ -719,10 +735,11 @@ namespace Aimmy2.AILogic
 
                 using var screenTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
 
-                if (_desktopImage == null || _desktopImage.Description.Width != detectionBox.Width || _desktopImage.Description.Height != detectionBox.Height)
+                if (_desktopImage == null
+                    || _desktopImage.Description.Width != detectionBox.Width
+                    || _desktopImage.Description.Height != detectionBox.Height)
                 {
                     _desktopImage?.Dispose();
-
                     var desc = new Texture2DDescription
                     {
                         Width = (uint)detectionBox.Width,
@@ -735,34 +752,65 @@ namespace Aimmy2.AILogic
                         CPUAccessFlags = CpuAccessFlags.Read,
                         BindFlags = BindFlags.None
                     };
-
                     _desktopImage = _device.CreateTexture2D(desc);
                 }
 
-                _context!.CopySubresourceRegion(_desktopImage, 0, 0, 0, 0, screenTexture, 0, new Box(detectionBox.Left, detectionBox.Top, 0, detectionBox.Right, detectionBox.Bottom, 1));
+                _context!.CopySubresourceRegion(
+                    _desktopImage, 0,
+                    0, 0, 0,
+                    screenTexture, 0,
+                    new Box(
+                        detectionBox.Left,
+                        detectionBox.Top,
+                        0,
+                        detectionBox.Right,
+                        detectionBox.Bottom,
+                        1
+                    )
+                );
 
-                var map = _context.Map(_desktopImage, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+                var map = _context.Map(
+                    _desktopImage,
+                    0,
+                    MapMode.Read,
+                    Vortice.Direct3D11.MapFlags.None
+                );
 
-                if (_captureBitmap == null || _captureBitmap.Width != detectionBox.Width || _captureBitmap.Height != detectionBox.Height)
+                if (_captureBitmap == null
+                    || _captureBitmap.Width != detectionBox.Width
+                    || _captureBitmap.Height != detectionBox.Height)
                 {
                     _captureBitmap?.Dispose();
-                    _captureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height, PixelFormat.Format32bppArgb);
+                    _captureBitmap = new Bitmap(
+                        detectionBox.Width,
+                        detectionBox.Height,
+                        PixelFormat.Format32bppArgb
+                    );
                 }
 
                 var boundsRect = new Rectangle(0, 0, _captureBitmap.Width, _captureBitmap.Height);
-                var mapDest = _captureBitmap.LockBits(boundsRect, ImageLockMode.WriteOnly, _captureBitmap.PixelFormat);
+                var mapDest = _captureBitmap.LockBits(
+                    boundsRect,
+                    ImageLockMode.WriteOnly,
+                    _captureBitmap.PixelFormat
+                );
 
                 unsafe
                 {
-                    Buffer.MemoryCopy((void*)map.DataPointer, (void*)mapDest.Scan0, mapDest.Stride * mapDest.Height, map.RowPitch * detectionBox.Height);
+                    Buffer.MemoryCopy(
+                        (void*)map.DataPointer,
+                        (void*)mapDest.Scan0,
+                        mapDest.Stride * mapDest.Height,
+                        map.RowPitch * detectionBox.Height
+                    );
                 }
                 _captureBitmap.UnlockBits(mapDest);
+
                 _context.Unmap(_desktopImage, 0);
                 _outputDuplication.ReleaseFrame();
 
                 return _captureBitmap;
             }
-
             catch (SharpGenException ex)
             {
                 FileManager.LogError("SharpGenException: " + ex);
@@ -775,6 +823,9 @@ namespace Aimmy2.AILogic
                 return null;
             }
         }
+
+
+
         private Bitmap GDIScreen(Rectangle detectionBox)
         {
             if (detectionBox.Width <= 0 || detectionBox.Height <= 0)
@@ -809,6 +860,8 @@ namespace Aimmy2.AILogic
             return _captureBitmap;
         }
 
+
+
         private void SaveFrame(Bitmap frame, Prediction? DoLabel = null)
         {
             if (!Dictionary.toggleState["Collect Data While Playing"] || Dictionary.toggleState["Constant AI Tracking"] || (DateTime.Now - lastSavedTime).TotalMilliseconds < 500) return;
@@ -830,6 +883,7 @@ namespace Aimmy2.AILogic
                 File.WriteAllText(labelPath, $"0 {x} {y} {width} {height}");
             }
         }
+
         #region Reinitialization, Clamping, Misc
         public void ReinitializeD3D11()
         {
@@ -861,50 +915,32 @@ namespace Aimmy2.AILogic
             return dist;
         };
 
-        public static unsafe float[] BitmapToFloatArray(Bitmap image)
+        public static unsafe void BitmapToFloatArray(Bitmap image, float[] buffer)
         {
-            int height = image.Height;
-            int width = image.Width;
-            int pixelCount = height * width;
-            float[] result = new float[3 * pixelCount];
-            float multiplier = 1.0f / 31.0f;
-
-            var rect = new Rectangle(0, 0, width, height);
+            int w = image.Width, h = image.Height, px = w * h;
+            var rect = new Rectangle(0, 0, w, h);
             var bmpData = image.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format16bppRgb555);
 
-            try
+            byte* ptr = (byte*)bmpData.Scan0;
+            float mul = 1f / 31f;
+            int stride = bmpData.Stride;
+
+            for (int y = 0; y < h; y++)
             {
-                int stride = bmpData.Stride;
-                IntPtr scan0 = bmpData.Scan0;
-
-
-                byte* p = (byte*)scan0.ToPointer();
-                _ = Parallel.For(0, height, y =>
+                byte* row = ptr + y * stride;
+                for (int x = 0; x < w; x++)
                 {
-                    byte* row = p + y * stride;
-                    int rowOffset = y * width;
-                    for (int i = 0; i < width; i++)
-                    {
-                        int pixelIndex = i * 2;
-                        int resultIndex = rowOffset + i;
-                        ushort pixel = (ushort)(row[pixelIndex] | (row[pixelIndex + 1] << 8));
-                        float r = ((pixel >> 10) & 0x1F) * multiplier;
-                        float g = ((pixel >> 5) & 0x1F) * multiplier;
-                        float b = (pixel & 0x1F) * multiplier;
-                        result[resultIndex] = r;
-                        result[pixelCount + resultIndex] = g;
-                        result[2 * pixelCount + resultIndex] = b;
-                    }
-                });
-
-            }
-            finally
-            {
-                image.UnlockBits(bmpData);
+                    int idx = y * w + x;
+                    ushort pix = (ushort)(row[2 * x] | (row[2 * x + 1] << 8));
+                    buffer[idx] = ((pix >> 10) & 0x1F) * mul;
+                    buffer[px + idx] = ((pix >> 5) & 0x1F) * mul;
+                    buffer[2 * px + idx] = (pix & 0x1F) * mul;
+                }
             }
 
-            return result;
+            image.UnlockBits(bmpData);
         }
+
 
         #endregion complicated math
         public void Dispose()
