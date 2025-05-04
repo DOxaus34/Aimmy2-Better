@@ -1,8 +1,9 @@
-using Aimmy2.Class;
+﻿using Aimmy2.Class;
 using Aimmy2.MouseMovementLibraries.GHubSupport;
 using Aimmy2.MouseMovementLibraries.RazerSupport;
 using Aimmy2.MouseMovementLibraries.SendInputSupport;
 using Aimmy2.WinformsReplacement;
+using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
 
@@ -16,6 +17,8 @@ namespace Aimmy2.InputLogic
         private static DateTime LastClickTime = DateTime.MinValue;
         private static int LastAntiRecoilClickTime = 0;
 
+
+
         private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         private const uint MOUSEEVENTF_LEFTUP = 0x0004;
         private const uint MOUSEEVENTF_MOVE = 0x0001;
@@ -23,6 +26,14 @@ namespace Aimmy2.InputLogic
         private static double previousY = 0;
         public static double smoothingFactor = 0.5;
         public static bool IsEMASmoothingEnabled = false;
+        // === Bezier slider bindings ===
+        private static double GetSlider(string key, double fallback = 0.0) =>
+    Dictionary.sliderSettings.TryGetValue(key, out var v) ? (double)v : fallback;
+
+        private static int GetSliderInt(string key, int fallback = 0) =>
+            (int)GetSlider(key, fallback);
+
+
 
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
@@ -134,55 +145,85 @@ namespace Aimmy2.InputLogic
 
         public static void MoveCrosshair(int detectedX, int detectedY)
         {
-            int halfScreenWidth = (int)ScreenWidth / 2;
-            int halfScreenHeight = (int)ScreenHeight / 2;
+            try
+            {
+                // 0. Guard against un‑initialised screen metrics
+                if (ScreenWidth == 0 || ScreenHeight == 0) return;
 
-            int targetX = detectedX - halfScreenWidth;
-            int targetY = detectedY - halfScreenHeight;
+                // 1. Parameters -------------------------------------------------------
+                double strength = GetSlider("Bezier Strength", 20) / 100.0;
+                int steps = Math.Max(1, GetSliderInt("Bezier Steps", 10));
 
-            double aspectRatioCorrection = ScreenWidth / ScreenHeight;
+                double sens = 1 - GetSlider("Mouse Sensitivity (+/-)", 0);
 
-            int MouseJitter = (int)Dictionary.sliderSettings["Mouse Jitter"];
-            int jitterX = MouseRandom.Next(-MouseJitter, MouseJitter);
-            int jitterY = MouseRandom.Next(-MouseJitter, MouseJitter);
+                // 2. Raw relative vector ---------------------------------------------
+                int rx = (int)(detectedX - ScreenWidth / 2);
+                int ry = (int)(detectedY - ScreenHeight / 2);
 
-            Point start = new(0, 0);
-            Point end = new(targetX, targetY);
-            Point control1 = new(start.X + (end.X - start.X) / 3, start.Y + (end.Y - start.Y) / 3);
-            Point control2 = new(start.X + 2 * (end.X - start.X) / 3, start.Y + 2 * (end.Y - start.Y) / 3);
-            Point newPosition = CubicBezier(start, end, control1, control2, 1 - Dictionary.sliderSettings["Mouse Sensitivity (+/-)"]);
+                int jitter = GetSliderInt("Mouse Jitter", 0);
+                rx = Math.Clamp(rx + MouseRandom.Next(-jitter, jitter), -150, 150);  //:contentReference[oaicite:5]{index=5}
+                ry = Math.Clamp(ry + MouseRandom.Next(-jitter, jitter), -150, 150);
 
-            targetX = Math.Clamp(targetX, -150, 150);
-            targetY = Math.Clamp(targetY, -150, 150);
+                // 3. Build Bezier path -----------------------------------------------
+                Point start = new(0, 0), end = new(rx, ry);
 
-            targetY = (int)(targetY * aspectRatioCorrection);
+                double len = Math.Max(1, Math.Sqrt(rx * rx + ry * ry));             // avoid /0
+                double px = -ry / len, py = rx / len;                                // perpendicular
+                double bend = strength * len * 0.5;
 
-            targetX += jitterX;
-            targetY += jitterY;
+                Point c1 = new((int)(rx / 3 + px * bend), (int)(ry / 3 + py * bend));
+                Point c2 = new((int)(2 * rx / 3 + px * bend), (int)(2 * ry / 3 + py * bend));
 
+                // 4. Step along the curve --------------------------------------------
+                Point prev = start;
+                for (int s = 1; s <= steps; ++s)
+                {
+                    double t = (s / (double)steps) * sens;
+                    Point p = CubicBezier(start, end, c1, c2, t);
+
+                    DispatchRelativeMove(p.X - prev.X, p.Y - prev.Y);
+                    prev = p;
+                }
+
+                previousX = prev.X;  // EMA smoothing uses these
+                previousY = prev.Y;
+
+                if (Dictionary.toggleState["Auto Trigger"])
+                    _ = Task.Run(DoTriggerClick);
+            }
+            catch (Exception ex)
+            {
+                // Visible in Output‑Debug window, keeps app alive
+                Debug.WriteLine($"[MoveCrosshair] {ex.GetType().Name}: {ex.Message}");
+                Debug.WriteLine(ex.StackTrace);
+            }
+        }
+
+
+
+        private static void DispatchRelativeMove(int dx, int dy)
+        {
             switch (Dictionary.dropdownState["Mouse Movement Method"])
             {
                 case "SendInput":
-                    SendInputMouse.SendMouseCommand(MOUSEEVENTF_MOVE, newPosition.X, newPosition.Y);
+                    SendInputMouse.SendMouseCommand(MOUSEEVENTF_MOVE, dx, dy);
                     break;
 
                 case "LG HUB":
-                    LGMouse.Move(0, newPosition.X, newPosition.Y, 0);
+                    LGMouse.Move(0, dx, dy, 0);
                     break;
 
                 case "Razer Synapse (Require Razer Peripheral)":
-                    RZMouse.mouse_move(newPosition.X, newPosition.Y, true);
+                    RZMouse.mouse_move(dx, dy, true);
                     break;
 
                 default:
-                    mouse_event(MOUSEEVENTF_MOVE, (uint)newPosition.X, (uint)newPosition.Y, 0, 0);
+                    mouse_event(MOUSEEVENTF_MOVE, (uint)dx, (uint)dy, 0, 0);
                     break;
             }
-
-            if (Dictionary.toggleState["Auto Trigger"])
-            {
-                Task.Run(DoTriggerClick);
-            }
         }
+
+
     }
+
 }

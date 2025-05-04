@@ -1,4 +1,4 @@
-using Visuality;
+﻿using Visuality;
 using Vortice.DXGI;
 
 namespace Aimmy2.Class
@@ -26,6 +26,8 @@ namespace Aimmy2.Class
         {
             { "Suggested Model", ""},
             { "FOV Size", 640 },
+              { "Bezier Strength", 20 },   // % curve, sensible mid‑value
+             { "Bezier Steps", 10 },       // number of micro‑moves
             { "Dynamic FOV Size", 200 },
             { "Mouse Sensitivity (+/-)", 0.80 },
             { "Mouse Jitter", 0 },

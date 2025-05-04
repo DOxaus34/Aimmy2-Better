@@ -14,6 +14,7 @@ using Microsoft.Win32;
 using SharpGen.Runtime;
 using Supercluster.KDTree;
 using Visuality;
+using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -581,8 +582,11 @@ namespace Aimmy2.AILogic
 
             return new Rectangle(x, y, width, height);
         }
+
+
         private Task<Prediction?> GetClosestPrediction(bool useMousePosition = true)
         {
+            // ── 1  Define the crop rectangle (640×640 centred on mouse or screen) ──
             var cursor = WinAPICaller.GetCursorPosition();
             targetX = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse"
                 ? cursor.X
@@ -599,53 +603,68 @@ namespace Aimmy2.AILogic
             );
             box = ClampRectangle(box, ScreenWidth, ScreenHeight);
 
-            var frame = ScreenGrab(box);
-            if (frame == null || _onnxModel == null)
+           bool captureOk;
+            if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
+            {
+                // D3D11Screen now returns true when the buffer is ready
+                captureOk = D3D11Screen(box);
+            }
+            else
+            {
+                // GDI path – still returns a Bitmap; convert it
+                Bitmap? bmp = GDIScreen(box);
+                captureOk = bmp != null;
+                if (captureOk)
+                    BitmapToFloatArray(bmp!, _inputBuffer);
+            }
+
+            if (!captureOk || _onnxModel == null)
                 return Task.FromResult<Prediction?>(null);
-
-            // Fill preallocated buffer in-place
-            BitmapToFloatArray(frame, _inputBuffer);
-
-            // Run inference with the single reusable input container
+            // ── 3  Run inference (tensor & container are pre‑allocated) ────────────
             using var results = _onnxModel.Run(_inputContainer, _outputNames, _modeloptions);
             var output = results[0].AsTensor<float>();
-
-            // Compute FOV bounds
+            // ── 4  Filter by FOV and confidence, collect surviving boxes ───────────
             float fovSize = (float)Dictionary.sliderSettings["FOV Size"];
             float half = (IMAGE_SIZE - fovSize) / 2;
             float fovMinX = half, fovMaxX = half + fovSize;
             float fovMinY = half, fovMaxY = half + fovSize;
 
-            // Filter & gather centers
             var (pts, preds) = PrepareKDTreeData(output, box, fovMinX, fovMaxX, fovMinY, fovMaxY);
             if (pts.Count == 0)
                 return Task.FromResult<Prediction?>(null);
 
-            // Linear nearest-neighbor
-            double center = IMAGE_SIZE / 2.0;
-            Prediction best = null!;
+            // ── 5  Pick the detection closest to the crop centre ───────────────────
+            double centre = IMAGE_SIZE / 2.0;
+            int bestIdx = 0;
             double bestDist = double.MaxValue;
             for (int i = 0; i < pts.Count; i++)
             {
-                double dx = pts[i][0] - center;
-                double dy = pts[i][1] - center;
+                double dx = pts[i][0] - centre;
+                double dy = pts[i][1] - centre;
                 double d2 = dx * dx + dy * dy;
                 if (d2 < bestDist)
                 {
                     bestDist = d2;
-                    best = preds[i];
+                    bestIdx = i;
                 }
             }
 
-            // Translate to screen coords and return
+            var best = preds[bestIdx];
+
+            // ── 6  Translate the rectangle back into absolute screen space ────────
             best.Rectangle = new RectangleF(
                 best.Rectangle.X + box.Left,
                 best.Rectangle.Y + box.Top,
                 best.Rectangle.Width,
                 best.Rectangle.Height
             );
+
             return Task.FromResult<Prediction?>(best);
         }
+
+
+
+
 
 
         private static (List<double[]> points, List<Prediction> preds)
@@ -698,13 +717,13 @@ namespace Aimmy2.AILogic
             {
                 if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
                 {
-                    Bitmap? frame = D3D11Screen(detectionBox);
-                    return frame;
+                    // Fast DX path fills _inputBuffer; we do not materialise a Bitmap.
+                    bool ok = D3D11Screen(detectionBox);
+                    return ok ? null : null;        // keeps signature, avoids compile error
                 }
                 else
                 {
-                    Bitmap? frame = GDIScreen(detectionBox);
-                    return frame;
+                    return GDIScreen(detectionBox); // legacy path
                 }
             }
             catch (Exception e)
@@ -713,37 +732,30 @@ namespace Aimmy2.AILogic
                 return null;
             }
         }
-        private Bitmap? D3D11Screen(Rectangle detectionBox)
+
+        // --- high‑speed capture that fills _inputBuffer in‑place ---------------
+        private bool D3D11Screen(Rectangle box)
         {
             try
             {
                 if (_device == null || _context == null || _outputDuplication == null)
-                {
-                    FileManager.LogError("Device, context, or textures are null, attempting to reinitialize");
                     ReinitializeD3D11();
 
-                    if (_device == null || _context == null || _outputDuplication == null)
-                        throw new InvalidOperationException("Device, context, or textures are still null after reinitialization.");
-                }
+                var hr = _outputDuplication!.AcquireNextFrame(500, out _, out var desktopResource);
+                if (hr != Result.Ok) { _outputDuplication.ReleaseFrame(); return false; }
 
-                var result = _outputDuplication!.AcquireNextFrame(500, out var frameInfo, out var desktopResource);
-                if (result != Result.Ok)
-                {
-                    _outputDuplication.ReleaseFrame();
-                    return null;
-                }
+                using var fullTex = desktopResource.QueryInterface<ID3D11Texture2D>();
 
-                using var screenTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
-
-                if (_desktopImage == null
-                    || _desktopImage.Description.Width != detectionBox.Width
-                    || _desktopImage.Description.Height != detectionBox.Height)
+                // (Re)create staging tex only if size changed
+                if (_desktopImage == null ||
+                    _desktopImage.Description.Width != box.Width ||
+                    _desktopImage.Description.Height != box.Height)
                 {
                     _desktopImage?.Dispose();
-                    var desc = new Texture2DDescription
+                    _desktopImage = _device.CreateTexture2D(new Texture2DDescription
                     {
-                        Width = (uint)detectionBox.Width,
-                        Height = (uint)detectionBox.Height,
+                        Width = (uint)box.Width,
+                        Height = (uint)box.Height,
                         MipLevels = 1,
                         ArraySize = 1,
                         Format = Format.B8G8R8A8_UNorm,
@@ -751,78 +763,31 @@ namespace Aimmy2.AILogic
                         Usage = ResourceUsage.Staging,
                         CPUAccessFlags = CpuAccessFlags.Read,
                         BindFlags = BindFlags.None
-                    };
-                    _desktopImage = _device.CreateTexture2D(desc);
+                    });
                 }
 
-                _context!.CopySubresourceRegion(
-                    _desktopImage, 0,
-                    0, 0, 0,
-                    screenTexture, 0,
-                    new Box(
-                        detectionBox.Left,
-                        detectionBox.Top,
-                        0,
-                        detectionBox.Right,
-                        detectionBox.Bottom,
-                        1
-                    )
+                _context.CopySubresourceRegion(
+                    _desktopImage, 0, 0, 0, 0,
+                    fullTex, 0,
+                    new Box(box.Left, box.Top, 0, box.Right, box.Bottom, 1)
                 );
 
-                var map = _context.Map(
-                    _desktopImage,
-                    0,
-                    MapMode.Read,
-                    Vortice.Direct3D11.MapFlags.None
-                );
-
-                if (_captureBitmap == null
-                    || _captureBitmap.Width != detectionBox.Width
-                    || _captureBitmap.Height != detectionBox.Height)
-                {
-                    _captureBitmap?.Dispose();
-                    _captureBitmap = new Bitmap(
-                        detectionBox.Width,
-                        detectionBox.Height,
-                        PixelFormat.Format32bppArgb
-                    );
-                }
-
-                var boundsRect = new Rectangle(0, 0, _captureBitmap.Width, _captureBitmap.Height);
-                var mapDest = _captureBitmap.LockBits(
-                    boundsRect,
-                    ImageLockMode.WriteOnly,
-                    _captureBitmap.PixelFormat
-                );
-
-                unsafe
-                {
-                    Buffer.MemoryCopy(
-                        (void*)map.DataPointer,
-                        (void*)mapDest.Scan0,
-                        mapDest.Stride * mapDest.Height,
-                        map.RowPitch * detectionBox.Height
-                    );
-                }
-                _captureBitmap.UnlockBits(mapDest);
-
+                // Map once, convert directly into _inputBuffer
+                var map = _context.Map(_desktopImage, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+                ConvertBGRA8ToCHWFloat(map, box.Width, box.Height, _inputBuffer);
                 _context.Unmap(_desktopImage, 0);
                 _outputDuplication.ReleaseFrame();
 
-                return _captureBitmap;
+                return true;        // buffer is ready
             }
-            catch (SharpGenException ex)
+            catch (Exception ex)
             {
-                FileManager.LogError("SharpGenException: " + ex);
+                FileManager.LogError("DX11 capture failed: " + ex.Message);
                 ReinitializeD3D11();
-                return null;
-            }
-            catch (Exception e)
-            {
-                FileManager.LogError("Error capturing screen:" + e);
-                return null;
+                return false;
             }
         }
+
 
 
 
@@ -943,6 +908,39 @@ namespace Aimmy2.AILogic
 
 
         #endregion complicated math
+
+        /// <summary>Fast BGRA‑8 → CHW float32 normalised 0‑1.</summary>
+        private static unsafe void ConvertBGRA8ToCHWFloat(
+            Vortice.Direct3D11.MappedSubresource src, int width, int height, float[] dst)
+        {
+            byte* pSrc = (byte*)src.DataPointer;
+            int pitch = (int)src.RowPitch;
+            int px = width * height;
+
+            fixed (float* pDst = dst)
+            {
+                float* r = pDst;           // [0 ..  px)
+                float* g = pDst + px;      // [px .. 2px)
+                float* b = pDst + 2 * px;  // [2px.. 3px)
+
+                for (int y = 0; y < height; y++)
+                {
+                    byte* row = pSrc + y * pitch;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int idx = y * width + x;
+                        b[idx] = row[x * 4 + 0] / 255f;   // B
+                        g[idx] = row[x * 4 + 1] / 255f;   // G
+                        r[idx] = row[x * 4 + 2] / 255f;   // R
+                    }
+                }
+            }
+        }
+
+
+
+
+
         public void Dispose()
         {
             _isAiLoopRunning = false;
