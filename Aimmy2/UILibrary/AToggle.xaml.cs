@@ -24,7 +24,10 @@ namespace Aimmy2.UILibrary
 
         public void SetColorAnimation(Color fromColor, Color toColor, TimeSpan duration)
         {
-            ColorAnimation animation = new ColorAnimation(fromColor, toColor, duration);
+            ColorAnimation animation = new ColorAnimation(fromColor, toColor, duration)
+            {
+                EasingFunction = Animator.Smooth
+            };
             SwitchMoving.Background.BeginAnimation(SolidColorBrush.ColorProperty, animation);
         }
 

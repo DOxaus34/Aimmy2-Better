@@ -1,15 +1,52 @@
 ﻿using Newtonsoft.Json;
 using System.IO;
 using MessageBox = System.Windows.MessageBox;
+using System.Collections.Generic;
+using System;
 
-namespace Aimmy2.Class
+namespace Aimmy2
 {
     internal class SaveDictionary
     {
-        public static void WriteJSON(Dictionary<string, dynamic> dictionary, string path = "bin\\configs\\Default.cfg", string SuggestedModel = "", string ExtraStrings = "")
+        // Ensure all required directories exist at startup
+        public static void EnsureDirectoriesExist()
+        {
+            var requiredDirectories = new[]
+            {
+                "bin",
+                "bin/configs",
+                "bin/anti_recoil_configs",
+                "bin/labels",
+                "bin/models"
+            };
+
+            foreach (var dir in requiredDirectories)
+            {
+                if (!Directory.Exists(dir))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log the error but don't crash - the app might still work without some directories
+                        System.Diagnostics.Debug.WriteLine($"Failed to create directory {dir}: {ex.Message}");
+                    }
+                }
+            }
+        }
+        public static void WriteJSON(Dictionary<string, dynamic> dictionary, string path = "bin/configs/Default.cfg", string SuggestedModel = "", string ExtraStrings = "")
         {
             try
             {
+                // Ensure the directory exists
+                string? directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
                 var SavedJSONSettings = new Dictionary<string, dynamic>(dictionary);
                 if (!string.IsNullOrEmpty(SuggestedModel) && SavedJSONSettings.ContainsKey("Suggested Model"))
                 {
@@ -21,14 +58,22 @@ namespace Aimmy2.Class
             }
             catch (Exception ex)
             {
+                // Only show error if it's not a directory creation issue
                 MessageBox.Show($"Error writing JSON, please note:\n{ex}");
             }
         }
 
-        public static void LoadJSON(Dictionary<string, dynamic> dictionary, string path = "bin\\configs\\Default.cfg", bool strict = true)
+        public static void LoadJSON(Dictionary<string, dynamic> dictionary, string path = "bin/configs/Default.cfg", bool strict = true)
         {
             try
             {
+                // Ensure the directory exists before checking for the file
+                string? directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
                 if (!File.Exists(path))
                 {
                     WriteJSON(dictionary, path);
@@ -52,7 +97,16 @@ namespace Aimmy2.Class
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Error loading JSON, please note:\n" + ex.ToString());
+                // If there's an error loading, try to recreate the file with defaults
+                try
+                {
+                    WriteJSON(dictionary, path);
+                }
+                catch
+                {
+                    // Only show error if we can't even create a default file
+                    MessageBox.Show("Error loading JSON, please note:\n" + ex.ToString());
+                }
             }
         }
     }

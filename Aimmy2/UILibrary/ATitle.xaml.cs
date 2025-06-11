@@ -1,4 +1,5 @@
 ﻿using Aimmy2.Class;
+using System.Windows;
 
 namespace Aimmy2.UILibrary
 {
@@ -7,6 +8,25 @@ namespace Aimmy2.UILibrary
     /// </summary>
     public partial class ATitle : System.Windows.Controls.UserControl
     {
+        public static readonly DependencyProperty TitleTextProperty = DependencyProperty.Register(
+            "TitleText", typeof(string), typeof(ATitle), new PropertyMetadata("Default Title", OnTitleTextPropertyChanged));
+
+        public string TitleText
+        {
+            get => (string)GetValue(TitleTextProperty);
+            set => SetValue(TitleTextProperty, value);
+        }
+
+        private static void OnTitleTextPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((ATitle)d).LabelTitle.Content = e.NewValue;
+        }
+
+        public ATitle()
+        {
+            InitializeComponent();
+        }
+
         public ATitle(string Text, bool MinimizableMenu = false)
         {
             InitializeComponent();

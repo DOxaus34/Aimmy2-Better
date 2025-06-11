@@ -26,6 +26,17 @@ namespace Aimmy2.InputLogic
         private static double previousY = 0;
         public static double smoothingFactor = 0.5;
         public static bool IsEMASmoothingEnabled = false;
+
+        // State for smoothed target coordinates
+        private static double smoothedX = 0;
+        private static double smoothedY = 0;
+        
+        // WindMouse State
+        private static double wind_veloX = 0, wind_veloY = 0, wind_windX = 0, wind_windY = 0;
+        private static readonly Random wind_random = new Random();
+        private static PointF wind_mousePos = PointF.Empty;
+        private static PointF wind_destination = PointF.Empty;
+
         // === Bezier slider bindings ===
         private static double GetSlider(string key, double fallback = 0.0) =>
     Dictionary.sliderSettings.TryGetValue(key, out var v) ? (double)v : fallback;
@@ -49,12 +60,6 @@ namespace Aimmy2.InputLogic
 
             double x = uuu * start.X + 3 * uu * t * control1.X + 3 * u * tt * control2.X + ttt * end.X;
             double y = uuu * start.Y + 3 * uu * t * control1.Y + 3 * u * tt * control2.Y + ttt * end.Y;
-
-            if (IsEMASmoothingEnabled)
-            {
-                x = EmaSmoothing(previousX, x, smoothingFactor);
-                y = EmaSmoothing(previousY, y, smoothingFactor);
-            }
 
             return new Point((int)x, (int)y);
         }
@@ -147,59 +152,180 @@ namespace Aimmy2.InputLogic
         {
             try
             {
-                // 0. Guard against un‑initialised screen metrics
+                // 0. Guard against un-initialised screen metrics
                 if (ScreenWidth == 0 || ScreenHeight == 0) return;
 
-                // 1. Parameters -------------------------------------------------------
-                double strength = GetSlider("Bezier Strength", 20) / 100.0;
-                int steps = Math.Max(1, GetSliderInt("Bezier Steps", 10));
+                // Apply EMA Smoothing to the target coordinates if enabled
+                if (IsEMASmoothingEnabled)
+                {
+                    // Initialize smoothed coordinates on the first run
+                    if (smoothedX == 0 && smoothedY == 0)
+                    {
+                        smoothedX = detectedX;
+                        smoothedY = detectedY;
+                    }
+                    smoothedX = EmaSmoothing(smoothedX, detectedX, smoothingFactor);
+                    smoothedY = EmaSmoothing(smoothedY, detectedY, smoothingFactor);
+                }
+                else
+                {
+                    smoothedX = detectedX;
+                    smoothedY = detectedY;
+                }
 
-                double sens = 1 - GetSlider("Mouse Sensitivity (+/-)", 0);
+                if (Dictionary.toggleState["WindMouse"])
+                {
+                    // Use absolute coordinates for WindMouse state
+                    if (wind_mousePos == PointF.Empty)
+                    {
+                        var p = WinAPICaller.GetCursorPosition();
+                        wind_mousePos = new PointF(p.X, p.Y);
+                    }
+                    // Update destination
+                    wind_destination = new PointF((float)smoothedX, (float)smoothedY);
+                    WindMouse();
+                }
+                else
+                {
+                    // If WindMouse is not active, reset its state.
+                    if (wind_mousePos != PointF.Empty)
+                    {
+                        wind_mousePos = PointF.Empty;
+                        wind_destination = PointF.Empty;
+                        wind_veloX = 0;
+                        wind_veloY = 0;
+                        wind_windX = 0;
+                        wind_windY = 0;
+                    }
+                    
+                int rx = (int)(smoothedX - ScreenWidth / 2);
+                int ry = (int)(smoothedY - ScreenHeight / 2);
 
-                // 2. Raw relative vector ---------------------------------------------
-                int rx = (int)(detectedX - ScreenWidth / 2);
-                int ry = (int)(detectedY - ScreenHeight / 2);
+                    if (Dictionary.toggleState["Bezier Curve"])
+                    {
+                        // Bezier Path
+                        double strength = GetSlider("Bezier Strength", 20) / 100.0;
+                        int steps = Math.Max(1, GetSliderInt("Bezier Steps", 10));
+                        double sens = 1 - GetSlider("Mouse Sensitivity (+/-)", 0);
 
-                int jitter = GetSliderInt("Mouse Jitter", 0);
-                rx = Math.Clamp(rx + MouseRandom.Next(-jitter, jitter), -150, 150);  //:contentReference[oaicite:5]{index=5}
-                ry = Math.Clamp(ry + MouseRandom.Next(-jitter, jitter), -150, 150);
-
-                // 3. Build Bezier path -----------------------------------------------
                 Point start = new(0, 0), end = new(rx, ry);
 
-                double len = Math.Max(1, Math.Sqrt(rx * rx + ry * ry));             // avoid /0
-                double px = -ry / len, py = rx / len;                                // perpendicular
+                        double len = Math.Max(1, Math.Sqrt(rx * rx + ry * ry));
+                        double px = -ry / len, py = rx / len;
                 double bend = strength * len * 0.5;
 
                 Point c1 = new((int)(rx / 3 + px * bend), (int)(ry / 3 + py * bend));
                 Point c2 = new((int)(2 * rx / 3 + px * bend), (int)(2 * ry / 3 + py * bend));
 
-                // 4. Step along the curve --------------------------------------------
                 Point prev = start;
                 for (int s = 1; s <= steps; ++s)
                 {
                     double t = (s / (double)steps) * sens;
                     Point p = CubicBezier(start, end, c1, c2, t);
-
                     DispatchRelativeMove(p.X - prev.X, p.Y - prev.Y);
                     prev = p;
                 }
-
-                previousX = prev.X;  // EMA smoothing uses these
+                        previousX = prev.X;
                 previousY = prev.Y;
+                    }
+                    else
+                    {
+                        // Linear Path
+                        double sens = 1 - GetSlider("Mouse Sensitivity (+/-)", 0);
+                        int moveX = (int)(rx * sens);
+                        int moveY = (int)(ry * sens);
+                        DispatchRelativeMove(moveX, moveY);
+                        previousX = moveX;
+                        previousY = moveY;
+                    }
+                }
 
                 if (Dictionary.toggleState["Auto Trigger"])
                     _ = Task.Run(DoTriggerClick);
             }
             catch (Exception ex)
             {
-                // Visible in Output‑Debug window, keeps app alive
+                // Visible in Output-Debug window, keeps app alive
                 Debug.WriteLine($"[MoveCrosshair] {ex.GetType().Name}: {ex.Message}");
                 Debug.WriteLine(ex.StackTrace);
             }
         }
 
+        private static void WindMouse()
+        {
+            // Vector from current virtual position to destination
+            double targetX = wind_destination.X - wind_mousePos.X;
+            double targetY = wind_destination.Y - wind_mousePos.Y;
 
+            double dist = Math.Sqrt(targetX * targetX + targetY * targetY);
+            if (dist < 1.0)
+            {
+                // We are at the destination. Stop.
+                wind_veloX = 0;
+                wind_veloY = 0;
+                return;
+            }
+
+            // Get params from reference and make them configurable via sliders eventually
+            double G_0 = GetSlider("WindMouse Gravity", 9);
+            double W_0 = GetSlider("WindMouse Wind Strength", 3);
+            double M_0 = 15.0; // Max speed
+            double D_0 = 12.0; // Dampen range
+            
+            // Calculate wind based on distance
+            double W_mag = Math.Min(W_0, dist);
+            if (dist >= D_0)
+            {
+                wind_windX = wind_windX / Math.Sqrt(3) + (wind_random.NextDouble() * 2 - 1) * W_mag / Math.Sqrt(5);
+                wind_windY = wind_windY / Math.Sqrt(3) + (wind_random.NextDouble() * 2 - 1) * W_mag / Math.Sqrt(5);
+            }
+            else // Within dampen range
+            {
+                wind_windX /= Math.Sqrt(3);
+                wind_windY /= Math.Sqrt(3);
+                if (M_0 < 3)
+                {
+                    M_0 = wind_random.NextDouble() * 3 + 3;
+                }
+                else
+                {
+                    M_0 /= Math.Sqrt(5);
+                }
+            }
+
+            // Update velocity with wind and gravity
+            wind_veloX += wind_windX + G_0 * targetX / dist;
+            wind_veloY += wind_windY + G_0 * targetY / dist;
+
+            // Clip velocity
+            double v_mag = Math.Sqrt(wind_veloX * wind_veloX + wind_veloY * wind_veloY);
+            if (v_mag > M_0)
+            {
+                double v_clip = M_0 / 2 + wind_random.NextDouble() * M_0 / 2;
+                wind_veloX = (wind_veloX / v_mag) * v_clip;
+                wind_veloY = (wind_veloY / v_mag) * v_clip;
+            }
+
+            // Calculate the move for this frame
+            double moveX = wind_veloX;
+            double moveY = wind_veloY;
+
+            // Don't overshoot
+            if (Math.Sqrt(moveX * moveX + moveY * moveY) > dist)
+            {
+                moveX = targetX;
+                moveY = targetY;
+                wind_veloX = 0; // Stop momentum
+                wind_veloY = 0;
+            }
+
+            // Update our virtual position
+            wind_mousePos.X += (float)moveX;
+            wind_mousePos.Y += (float)moveY;
+
+            // And move the real mouse
+            DispatchRelativeMove((int)Math.Round(moveX), (int)Math.Round(moveY));
+        }
 
         private static void DispatchRelativeMove(int dx, int dy)
         {

@@ -2,7 +2,10 @@
   "profiles": {
     "Aimmy2": {
       "commandName": "Project",
-      "workingDirectory": "C:\\Users\\Fantasir\\Desktop\\Killniggers\\Aimmy2\\bin\\Release\\net8.0-windows"
+      "workingDirectory": "C:\\Users\\xxfan\\OneDrive\\Desktop\\Aimmy2-Better-2.2.3\\Aimmy2-Better-2.2.3\\Aimmy2\\bin\\Release\\net8.0-windows",
+      "environmentVariables": {
+        "Path": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\bin"
+      }
     }
   }
 }

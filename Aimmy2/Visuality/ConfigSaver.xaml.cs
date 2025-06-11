@@ -8,6 +8,7 @@ using System.Windows.Media.Animation;
 using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
 using MessageBox = System.Windows.MessageBox;
+using Aimmy2;
 
 namespace Visuality
 {
