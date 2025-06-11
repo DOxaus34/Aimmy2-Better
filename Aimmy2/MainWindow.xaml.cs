@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using MaterialDesignThemes.Wpf;
 using UILibrary;
 using Visuality;
 using Application = System.Windows.Application;
@@ -36,6 +37,12 @@ namespace Aimmy2
         private HashSet<string> AvailableModels = new();
         private HashSet<string> AvailableConfigs = new();
 
+        // Flags for Lazy Loading
+        private bool isAimMenuLoaded = false;
+        private bool isSettingsMenuLoaded = false;
+        private bool isCreditsMenuLoaded = false;
+        private bool isStoreMenuLoaded = false;
+
         private static double ActualFOV = 640;
 
         #endregion Main Variables
@@ -45,90 +52,127 @@ namespace Aimmy2
         public MainWindow()
         {
             InitializeComponent();
-
-            CurrentScrollViewer = FindName("AimMenu") as ScrollViewer;
-            if (CurrentScrollViewer == null) throw new NullReferenceException("CurrentScrollViewer is null");
-
-            Dictionary.DetectedPlayerOverlay = DPWindow;
-            Dictionary.FOVWindow = FOVWindow;
-
-            RequirementsManager.MainWindowInit();
-
-            fileManager = new FileManager(ModelListBox, SelectedModelNotifier, ConfigsListBox, SelectedConfigNotifier);
-
-            if (!File.Exists("bin\\labels\\labels.txt")) { File.WriteAllText("bin\\labels\\labels.txt", "Enemy"); }
-
-            FileManager.LoadConfig(uiManager: uiManager);
-
-            SaveDictionary.LoadJSON(Dictionary.minimizeState, "bin\\minimize.cfg");
-            SaveDictionary.LoadJSON(Dictionary.bindingSettings, "bin\\binding.cfg");
-            SaveDictionary.LoadJSON(Dictionary.colorState, "bin\\colors.cfg");
-            SaveDictionary.LoadJSON(Dictionary.filelocationState, "bin\\filelocations.cfg");
-
-            Dictionary<string, dynamic> tempToggleState = new() { { "Debug Mode", false } };
-            SaveDictionary.LoadJSON(tempToggleState, "bin\\toggleState.cfg", false);
-
-            if (tempToggleState["Debug Mode"])
-            {
-                Dictionary.toggleState["Debug Mode"] = true;
-                FileManager.LogInfo("Debug mode was found ON during last launch, automatically enabling...");
-
-                //try
-                //{
-                //    //FileManager.LogInfo($"Toggle state keys: {Dictionary.toggleState.Keys}, Toggle state values: {Dictionary.toggleState.Values}\n"
-                //     //   + $"Slider setting keys: {Dictionary.sliderSettings.Keys}, Slider setting values: {Dictionary.sliderSettings.Values}");
-                //}
-                //catch (Exception ex)
-                //{
-                //    FileManager.LogError("Error while logging debug info: " + ex, true);
-                //}
-            }
-
-            bindingManager = new InputBindingManager();
-            bindingManager.SetupDefault("Aim Keybind", Dictionary.bindingSettings["Aim Keybind"]);
-
-            LoadAimMenu();
-            LoadSettingsMenu();
-            LoadCreditsMenu();
-            LoadStoreMenuAsync();
-
-            SaveDictionary.LoadJSON(Dictionary.dropdownState, "bin\\dropdown.cfg");
-            LoadDropdownStates();
-
-            uiManager.DDI_TensorRT.Selected += OnExecutionProviderSelected;
-            uiManager.DDI_CUDA.Selected += OnExecutionProviderSelected;
-
-            LoadMenuMinimizers();
-            VisibilityXY();
-
-            ActualFOV = Dictionary.sliderSettings["FOV Size"];
-            PropertyChanger.ReceiveNewConfig = (configPath, load) => FileManager.LoadConfig(uiManager);
-
-            PropertyChanger.PostNewFOVSize(Dictionary.sliderSettings["FOV Size"]);
-            PropertyChanger.PostColor((Color)ColorConverter.ConvertFromString(Dictionary.colorState["FOV Color"]));
-            PropertyChanger.PostDPColor((Color)ColorConverter.ConvertFromString(Dictionary.colorState["Detected Player Color"]));
-            PropertyChanger.PostDPFontSize((int)Dictionary.sliderSettings["AI Confidence Font Size"]);
-            PropertyChanger.PostDPWCornerRadius((int)Dictionary.sliderSettings["Corner Radius"]);
-            PropertyChanger.PostDPWBorderThickness((double)Dictionary.sliderSettings["Border Thickness"]);
-            PropertyChanger.PostDPWOpacity((double)Dictionary.sliderSettings["Opacity"]);
-
         }
 
-        private async void LoadStoreMenuAsync() => await LoadStoreMenu();
+        private async void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            // This event should only be responsible for wiring up the UI after it's loaded.
+            // The heavy lifting is now done in the Preload sequence.
+        }
 
-        private void Window_Loaded(object sender, RoutedEventArgs e)
+        public async Task PreloadAsync()
+        {
+            // Runs file I/O on a background thread
+            await LoadDataAsync();
+
+            // Runs on the UI thread, creating all UI controls asynchronously
+            await CreateUIAsync();
+
+            // Runs network I/O on a background thread, then updates UI
+            await LoadStoreDataAsync();
+        }
+
+        private Task LoadDataAsync()
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    RequirementsManager.MainWindowInit();
+
+                    if (!File.Exists("bin\\labels\\labels.txt")) { File.WriteAllText("bin\\labels\\labels.txt", "Enemy"); }
+
+                    SaveDictionary.LoadJSON(Dictionary.minimizeState, "bin\\minimize.cfg");
+                    SaveDictionary.LoadJSON(Dictionary.bindingSettings, "bin\\binding.cfg");
+                    SaveDictionary.LoadJSON(Dictionary.colorState, "bin\\colors.cfg");
+                    SaveDictionary.LoadJSON(Dictionary.filelocationState, "bin\\filelocations.cfg");
+
+                    Dictionary<string, dynamic> tempToggleState = new() { { "Debug Mode", false } };
+                    SaveDictionary.LoadJSON(tempToggleState, "bin\\toggleState.cfg", false);
+
+                    if (tempToggleState["Debug Mode"])
+                    {
+                        Dictionary.toggleState["Debug Mode"] = true;
+                        FileManager.LogInfo("Debug mode was found ON during last launch, automatically enabling...");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    FileManager.LogError("Error during background data loading: " + ex, true);
+                }
+            });
+        }
+
+        private async Task CreateUIAsync()
         {
             try
             {
-                Topmost = Dictionary.toggleState["UI TopMost"];
+                // Must be on UI thread
+                fileManager = new FileManager(ModelListBox, SelectedModelNotifier, ConfigsListBox, SelectedConfigNotifier);
+                FileManager.LoadConfig(uiManager: uiManager);
 
+                CurrentScrollViewer = FindName("AimMenu") as ScrollViewer;
+                if (CurrentScrollViewer == null) throw new NullReferenceException("CurrentScrollViewer is null");
+
+                Dictionary.DetectedPlayerOverlay = DPWindow;
+                Dictionary.FOVWindow = FOVWindow;
+
+                bindingManager = new InputBindingManager();
+                bindingManager.SetupDefault("Aim Keybind", Dictionary.bindingSettings["Aim Keybind"]);
+
+                // LAZY LOADING: Load the default menu (AimMenu) on startup, but not the others.
+                await LoadAimMenuAsync();
+                isAimMenuLoaded = true;
+
+                SaveDictionary.LoadJSON(Dictionary.dropdownState, "bin\\dropdown.cfg");
+                LoadAimDropdownStates();
+
+                LoadMenuMinimizers();
+                VisibilityXY();
+
+                ActualFOV = Dictionary.sliderSettings["FOV Size"];
+                PropertyChanger.ReceiveNewConfig = (configPath, load) => FileManager.LoadConfig(uiManager);
+
+                PropertyChanger.PostNewFOVSize(Dictionary.sliderSettings["FOV Size"]);
+                await Task.Delay(1);
+                PropertyChanger.PostColor((Color)ColorConverter.ConvertFromString(Dictionary.colorState["FOV Color"]));
+                PropertyChanger.PostDPColor((Color)ColorConverter.ConvertFromString(Dictionary.colorState["Detected Player Color"]));
+                PropertyChanger.PostDPFontSize((int)Dictionary.sliderSettings["AI Confidence Font Size"]);
+                await Task.Delay(1);
+                PropertyChanger.PostDPWCornerRadius((int)Dictionary.sliderSettings["Corner Radius"]);
+                PropertyChanger.PostDPWBorderThickness((double)Dictionary.sliderSettings["Border Thickness"]);
+                PropertyChanger.PostDPWOpacity((double)Dictionary.sliderSettings["Opacity"]);
+
+                Topmost = Dictionary.toggleState["UI TopMost"];
                 AboutSpecs.Content = $"{GetProcessorName()} • {GetVideoControllerName()} • {GetFormattedMemorySize()}GB RAM";
             }
             catch (Exception ex)
             {
-                FileManager.LogError("Error loading window" + ex, true);
+                FileManager.LogError("Error creating UI: " + ex, true);
             }
         }
+        
+        private Task LoadStoreDataAsync()
+        {
+            return Task.Run(async () =>
+            {
+                try
+                {
+                    FileManager.LogInfo("Fetching models and configs from Github in the background...");
+                    
+                    Task models = FileManager.RetrieveAndAddFiles("https://api.github.com/repos/Babyhamsta/Aimmy/contents/models", "bin\\models", AvailableModels);
+                    Task configs = FileManager.RetrieveAndAddFiles("https://api.github.com/repos/Babyhamsta/Aimmy/contents/configs", "bin\\configs", AvailableConfigs);
+
+                    // Wait for data to be fetched, but do not build the UI yet.
+                    await Task.WhenAll(models, configs);
+                }
+                catch (Exception ex)
+                {
+                    FileManager.LogError("Error loading store data: " + ex, false);
+                }
+            });
+        }
+
         private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) => DragMove();
 
         private void Minimize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
@@ -175,12 +219,33 @@ namespace Aimmy2
 
         private async void MenuSwitch(object sender, RoutedEventArgs e)
         {
-            if (sender is Button clickedButton && !CurrentlySwitching && CurrentMenu != clickedButton.Tag.ToString())
+            if (sender is System.Windows.Controls.Button clickedButton && !CurrentlySwitching && CurrentMenu != clickedButton.Tag.ToString())
             {
                 CurrentlySwitching = true;
+                string? menuName = clickedButton.Tag.ToString();
                 Animator.ObjectShift(TimeSpan.FromMilliseconds(350), MenuHighlighter, MenuHighlighter.Margin, clickedButton.Margin);
-                await SwitchScrollPanels(FindName(clickedButton.Tag.ToString()) as ScrollViewer ?? throw new NullReferenceException("Scrollpanel is null"));
-                CurrentMenu = clickedButton.Tag.ToString()!;
+
+                // LAZY LOADING IMPLEMENTATION
+                if (menuName == "SettingsMenu" && !isSettingsMenuLoaded)
+                {
+                    await LoadSettingsMenuAsync();
+                    isSettingsMenuLoaded = true;
+                }
+                else if (menuName == "CreditsMenu" && !isCreditsMenuLoaded)
+                {
+                    await LoadCreditsMenuAsync();
+                    isCreditsMenuLoaded = true;
+                }
+                else if (menuName == "StoreMenu" && !isStoreMenuLoaded)
+                {
+                    // Now that we need it, build the Store UI
+                    DownloadGateway(ModelStoreScroller, AvailableModels, "models");
+                    DownloadGateway(ConfigStoreScroller, AvailableConfigs, "configs");
+                    isStoreMenuLoaded = true;
+                }
+
+                await SwitchScrollPanels(FindName(menuName) as ScrollViewer ?? throw new NullReferenceException("Scrollpanel is null"));
+                CurrentMenu = menuName!;
             }
         }
 
@@ -236,7 +301,111 @@ namespace Aimmy2
             }
         }
 
-        private void LoadDropdownStates()
+        private void ApplyChangesButton_Click(object sender, RoutedEventArgs e)
+        {
+            // Background
+            var themeColorPicker = FindName("ThemeColorPicker") as MaterialDesignThemes.Wpf.ColorPicker;
+            var gradientStop = FindName("RadialGradientColorStop") as GradientStop;
+            if (themeColorPicker != null && gradientStop != null)
+            {
+                gradientStop.Color = themeColorPicker.Color;
+            }
+
+            // Accent
+            var accentColorPicker = FindName("SecondColorPicker") as ColorPicker.StandardColorPicker;
+            var accentGradientStop = FindName("BlackGradientStop") as GradientStop;
+            if (accentColorPicker != null && accentGradientStop != null)
+            {
+                accentGradientStop.Color = accentColorPicker.SelectedColor;
+            }
+
+            // Font
+            var fontColorPicker = FindName("FontColorPicker") as ColorPicker.StandardColorPicker;
+            if (fontColorPicker != null)
+            {
+                var newBrush = new SolidColorBrush(fontColorPicker.SelectedColor);
+                ChangeAllTextForegroundColor(this, newBrush);
+            }
+        }
+
+        private void PreviewButton_Click(object sender, RoutedEventArgs e)
+        {
+            // For now, preview will do the same as apply.
+            ApplyChangesButton_Click(sender, e);
+        }
+
+        private void ResetDefaultsButton_Click(object sender, RoutedEventArgs e)
+        {
+            // Reset Background
+            var gradientStop = FindName("RadialGradientColorStop") as GradientStop;
+            if (gradientStop != null)
+            {
+                gradientStop.Color = (Color)ColorConverter.ConvertFromString("#FF120338");
+            }
+
+            // Reset Accent
+            var accentGradientStop = FindName("BlackGradientStop") as GradientStop;
+            if (accentGradientStop != null)
+            {
+                accentGradientStop.Color = Colors.Black;
+            }
+
+            // Reset Font
+            ChangeAllTextForegroundColor(this, new SolidColorBrush(Colors.White));
+
+            // Also reset the color pickers themselves
+            var themeColorPicker = FindName("ThemeColorPicker") as MaterialDesignThemes.Wpf.ColorPicker;
+            if (themeColorPicker != null)
+            {
+                themeColorPicker.Color = (Color)ColorConverter.ConvertFromString("#FF120338");
+            }
+            var accentColorPicker = FindName("SecondColorPicker") as ColorPicker.StandardColorPicker;
+            if (accentColorPicker != null)
+            {
+                accentColorPicker.SelectedColor = Colors.Black;
+            }
+            var fontColorPicker = FindName("FontColorPicker") as ColorPicker.StandardColorPicker;
+            if (fontColorPicker != null)
+            {
+                fontColorPicker.SelectedColor = Colors.White;
+            }
+        }
+
+        private void ChangeAllTextForegroundColor(DependencyObject parent, Brush brush)
+        {
+            if (parent == null) return;
+
+            if (parent is FrameworkElement fe && (fe.Name == "FantaEngineLabel" || fe.Name == "ForkedAndChangedBySection"))
+            {
+                return;
+            }
+
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, i);
+
+                if (child is TextBlock textBlock)
+                {
+                    textBlock.Foreground = brush;
+                }
+                else if (child is Label label)
+                {
+                    label.Foreground = brush;
+                }
+                else if (child is System.Windows.Controls.Button button)
+                {
+                    button.Foreground = brush;
+                }
+                else if (child is AntWpf.Controls.Button antButton)
+                {
+                    antButton.Foreground = brush;
+                }
+
+                ChangeAllTextForegroundColor(child, brush);
+            }
+        }
+
+        private void LoadAimDropdownStates()
         {
             // Detection Area Type Dropdown
             uiManager.D_DetectionAreaType!.DropdownBox.SelectedIndex = Dictionary.dropdownState["Detection Area Type"] switch
@@ -253,7 +422,10 @@ namespace Aimmy2
                 "Bottom" => 2,
                 _ => 0 // Default case if none of the above matches
             };
+        }
 
+        private void LoadSettingsDropdownStates()
+        {
             // Mouse Movement Method Dropdown
             uiManager.D_MouseMovementMethod!.DropdownBox.SelectedIndex = Dictionary.dropdownState["Mouse Movement Method"] switch
             {
@@ -269,6 +441,7 @@ namespace Aimmy2
                 _ => 0 // Default case if none of the above matches
             };
         }
+
         static void OnExecutionProviderSelected(object sender, RoutedEventArgs e)
         {
             if (Dictionary.dropdownState["Execution Provider Type"] == "TensorRT")
@@ -284,6 +457,11 @@ namespace Aimmy2
 
         private AToggle AddToggle(StackPanel panel, string title)
         {
+            if (!Dictionary.toggleState.ContainsKey(title))
+            {
+                Dictionary.toggleState[title] = false;
+            }
+
             var toggle = new AToggle(title);
             toggleInstances[title] = toggle;
 
@@ -299,7 +477,7 @@ namespace Aimmy2
                 Toggle_Action(title);
             };
 
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(toggle));
+            panel.Children.Add(toggle);
             return toggle;
         }
 
@@ -349,6 +527,18 @@ namespace Aimmy2
 
                 case "EMA Smoothening":
                     MouseManager.IsEMASmoothingEnabled = Dictionary.toggleState[title];
+                    if (uiManager.S_EMASmoothing != null)
+                        uiManager.S_EMASmoothing.Visibility = Dictionary.toggleState[title] ? Visibility.Visible : Visibility.Collapsed;
+                    break;
+
+                case "WindMouse":
+                    bool isWindMouseEnabled = Dictionary.toggleState[title];
+                    if (uiManager.S_WindMouseGravity != null)
+                        uiManager.S_WindMouseGravity.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
+                    if (uiManager.S_WindMouseWindStrength != null)
+                        uiManager.S_WindMouseWindStrength.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
+                    if (uiManager.S_WindMouseTargetJitter != null)
+                        uiManager.S_WindMouseTargetJitter.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
                     break;
 
                 case "X Axis Percentage Adjustment":
@@ -358,13 +548,19 @@ namespace Aimmy2
                 case "Y Axis Percentage Adjustment":
                     VisibilityXY();
                     break;
+
+                case "Bezier Curve":
+                    bool isEnabled = Dictionary.toggleState[title];
+                    uiManager.S_BezierStrength.Visibility = isEnabled ? Visibility.Visible : Visibility.Collapsed;
+                    uiManager.S_BezierSteps.Visibility = isEnabled ? Visibility.Visible : Visibility.Collapsed;
+                    break;
             }
         }
 
         private AKeyChanger AddKeyChanger(StackPanel panel, string title, string keybind)
         {
             var keyChanger = new AKeyChanger(title, keybind);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(keyChanger));
+            panel.Children.Add(keyChanger);
 
             keyChanger.Reader.Click += (sender, e) =>
             {
@@ -398,7 +594,7 @@ namespace Aimmy2
         {
             var colorChanger = new AColorChanger(title);
             colorChanger.ColorChangingBorder.Background = (Brush)new BrushConverter().ConvertFromString(Dictionary.colorState[title]);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(colorChanger));
+            panel.Children.Add(colorChanger);
             return colorChanger;
         }
 
@@ -416,21 +612,21 @@ namespace Aimmy2
             // Update the settings when the slider value changes
             slider.Slider.ValueChanged += (s, e) => settings[title] = slider.Slider.Value;
 
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(slider));
+            panel.Children.Add(slider);
             return slider;
         }
 
         private static ADropdown AddDropdown(StackPanel panel, string title)
         {
             var dropdown = new ADropdown(title, title);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(dropdown));
+            panel.Children.Add(dropdown);
             return dropdown;
         }
 
         private static AFileLocator AddFileLocator(StackPanel panel, string title, string filter = "All files (*.*)|*.*", string DLExtension = "")
         {
             var afilelocator = new AFileLocator(title, title, filter, DLExtension);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(afilelocator));
+            panel.Children.Add(afilelocator);
             return afilelocator;
         }
 
@@ -448,43 +644,49 @@ namespace Aimmy2
                 else throw new NullReferenceException("dropdown.DropdownTitle.Content.ToString() is null");
             };
 
-            Application.Current.Dispatcher.Invoke(() => dropdown.DropdownBox.Items.Add(dropdownitem));
+            dropdown.DropdownBox.Items.Add(dropdownitem);
             return dropdownitem;
         }
 
         private static ATitle AddTitle(StackPanel panel, string title, bool CanMinimize = false)
         {
-            var atitle = new ATitle(title, CanMinimize);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(atitle));
-            return atitle;
+            var titleControl = new ATitle(title, CanMinimize);
+            panel.Children.Add(titleControl);
+            return titleControl;
         }
 
         private static APButton AddButton(StackPanel panel, string title)
         {
             var button = new APButton(title);
-            Application.Current.Dispatcher.Invoke(() => panel.Children.Add(button));
+            panel.Children.Add(button);
             return button;
         }
 
-        private static void AddCredit(StackPanel panel, string name, string role) => Application.Current.Dispatcher.Invoke(() => panel.Children.Add(new ACredit(name, role)));
+        private static void AddCredit(StackPanel panel, string name, string role)
+        {
+            var credit = new ACredit
+            {
+                Title = name,
+                Description = role
+            };
+            panel.Children.Add(credit);
+        }
 
         private static void AddSeparator(StackPanel panel)
         {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                panel.Children.Add(new ARectangleBottom());
-                panel.Children.Add(new ASpacer());
-            });
+            panel.Children.Add(new ARectangleBottom());
+            panel.Children.Add(new ASpacer());
         }
 
         #endregion Menu Logic
 
         #region Menu Loading
-        private void LoadAimMenu()
+        private async Task LoadAimMenuAsync()
         {
             #region Aim Assist
 
             uiManager.AT_Aim = AddTitle(AimAssist, "Aim Assist", true);
+            await Task.Delay(1);
             uiManager.T_AimAligner = AddToggle(AimAssist, "Aim Assist");
             uiManager.T_AimAligner.Reader.Click += (s, e) =>
             {
@@ -496,7 +698,9 @@ namespace Aimmy2
                     new NoticeBar("Please load a model first", 5000).Show();
                 }
             };
+            await Task.Delay(1);
             uiManager.C_Keybind = AddKeyChanger(AimAssist, "Aim Keybind", Dictionary.bindingSettings["Aim Keybind"]);
+            await Task.Delay(1);
             uiManager.T_ConstantAITracking = AddToggle(AimAssist, "Constant AI Tracking");
             uiManager.T_ConstantAITracking.Reader.Click += (s, e) =>
             {
@@ -511,16 +715,21 @@ namespace Aimmy2
                     UpdateToggleUI(uiManager.T_AimAligner, true);
                 }
             };
+            await Task.Delay(1);
             uiManager.T_EMASmoothing = AddToggle(AimAssist, "EMA Smoothening");
+            await Task.Delay(1);
             AddSeparator(AimAssist);
+            await Task.Delay(1);
 
             #endregion Aim Assist
 
-            #region Config
+            #region Aim Config
 
             uiManager.AT_AimConfig = AddTitle(AimConfig, "Aim Config", true);
+            await Task.Delay(1);
 
             uiManager.D_DetectionAreaType = AddDropdown(AimConfig, "Detection Area Type");
+            await Task.Delay(1);
             uiManager.DDI_ClosestToCenterScreen = AddDropdownItem(uiManager.D_DetectionAreaType, "Closest to Center Screen");
             uiManager.DDI_ClosestToCenterScreen.Selected += async (sender, e) =>
             {
@@ -531,14 +740,20 @@ namespace Aimmy2
                     Convert.ToInt16((WinAPICaller.ScreenHeight / 2) / WinAPICaller.scalingFactorY) - 320,
                 0, 0));
             };
+            await Task.Delay(1);
 
             AddDropdownItem(uiManager.D_DetectionAreaType, "Closest to Mouse");
+            await Task.Delay(1);
 
             uiManager.D_AimingBoundariesAlignment = AddDropdown(AimConfig, "Aiming Boundaries Alignment");
+            await Task.Delay(1);
 
             AddDropdownItem(uiManager.D_AimingBoundariesAlignment, "Center");
+            await Task.Delay(1);
             AddDropdownItem(uiManager.D_AimingBoundariesAlignment, "Top");
+            await Task.Delay(1);
             AddDropdownItem(uiManager.D_AimingBoundariesAlignment, "Bottom");
+            await Task.Delay(1);
 
             uiManager.S_MouseSensitivity = AddSlider(AimConfig, "Mouse Sensitivity (+/-)", "Sensitivity", 0.01, 0.01, 0.01, 1);
             uiManager.S_MouseSensitivity.Slider.PreviewMouseLeftButtonUp += (sender, e) =>
@@ -546,13 +761,17 @@ namespace Aimmy2
                 if (uiManager.S_MouseSensitivity.Slider.Value >= 0.98) new NoticeBar("The Mouse Sensitivity you have set can cause Aimmy to be unable to aim, please decrease if you suffer from this problem", 10000).Show();
                 else if (uiManager.S_MouseSensitivity.Slider.Value <= 0.1) new NoticeBar("The Mouse Sensitivity you have set can cause Aimmy to be unstable to aim, please increase if you suffer from this problem", 10000).Show();
             };
+            await Task.Delay(1);
 
             uiManager.S_XOffset = AddSlider(AimConfig, "X Offset (Left/Right)", "Offset", 1, 1, -150, 150);
+            await Task.Delay(1);
             uiManager.S_XOffsetPercent = AddSlider(AimConfig, "X Offset (%)", "Percent", 1, 1, 0, 100);
+            await Task.Delay(1);
 
             uiManager.S_YOffset = AddSlider(AimConfig, "Y Offset (Up/Down)", "Offset", 1, 1, -150, 150);
+            await Task.Delay(1);
             uiManager.S_YOffsetPercent = AddSlider(AimConfig, "Y Offset (%)", "Percent", 1, 1, 0, 100);
-
+            await Task.Delay(1);
 
             uiManager.S_AIMinimumConfidence = AddSlider(AimConfig, "AI Minimum Confidence", "% Confidence", 1, 1, 1, 100);
             uiManager.S_AIMinimumConfidence.Slider.PreviewMouseLeftButtonUp += (sender, e) =>
@@ -560,8 +779,20 @@ namespace Aimmy2
                 if (uiManager.S_AIMinimumConfidence.Slider.Value >= 95) new NoticeBar("The minimum confidence you have set for Aimmy to be too high and may be unable to detect players.", 10000).Show();
                 else if (uiManager.S_AIMinimumConfidence.Slider.Value <= 35) new NoticeBar("The minimum confidence you have set for Aimmy may be too low can cause false positives.", 10000).Show();
             };
+            await Task.Delay(1);
+
+            uiManager.T_BezierCurve = AddToggle(AimConfig, "Bezier Curve");
+            uiManager.T_BezierCurve.Reader.Click += (s, e) =>
+            {
+                bool isEnabled = Dictionary.toggleState["Bezier Curve"];
+                uiManager.S_BezierStrength.Visibility = isEnabled ? Visibility.Visible : Visibility.Collapsed;
+                uiManager.S_BezierSteps.Visibility = isEnabled ? Visibility.Visible : Visibility.Collapsed;
+            };
+            await Task.Delay(1);
 
             uiManager.S_EMASmoothing = AddSlider(AimConfig, "EMA Smoothening", "Amount", 0.01, 0.01, 0.01, 1);
+            uiManager.S_EMASmoothing.Visibility = Dictionary.toggleState["EMA Smoothening"] ? Visibility.Visible : Visibility.Collapsed;
+            await Task.Delay(1);
 
             uiManager.S_BezierStrength = AddSlider(
              AimConfig,
@@ -572,6 +803,7 @@ namespace Aimmy2
              0,    // min
              100   // max
          );
+            await Task.Delay(1);
 
             uiManager.S_BezierSteps = AddSlider(
                 AimConfig,
@@ -582,24 +814,50 @@ namespace Aimmy2
                 1,    // min 1
                 50    // max 50
             );
+            await Task.Delay(1);
+
+            bool isBezierEnabled = Dictionary.toggleState["Bezier Curve"];
+            uiManager.S_BezierStrength.Visibility = isBezierEnabled ? Visibility.Visible : Visibility.Collapsed;
+            uiManager.S_BezierSteps.Visibility = isBezierEnabled ? Visibility.Visible : Visibility.Collapsed;
+
+            uiManager.T_WindMouse = AddToggle(AimConfig, "WindMouse");
+            await Task.Delay(1);
+            uiManager.S_WindMouseGravity = AddSlider(AimConfig, "WindMouse Gravity", "Gravity", 1, 1, 1, 50);
+            await Task.Delay(1);
+            uiManager.S_WindMouseWindStrength = AddSlider(AimConfig, "WindMouse Wind Strength", "Strength", 1, 1, 1, 50);
+            await Task.Delay(1);
+            uiManager.S_WindMouseTargetJitter = AddSlider(AimConfig, "WindMouse Target Jitter", "Jitter", 1, 1, 0, 20);
+            await Task.Delay(1);
+
+            bool isWindMouseEnabled = Dictionary.toggleState["WindMouse"];
+            uiManager.S_WindMouseGravity.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
+            uiManager.S_WindMouseWindStrength.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
+            uiManager.S_WindMouseTargetJitter.Visibility = isWindMouseEnabled ? Visibility.Visible : Visibility.Collapsed;
 
             AddSeparator(AimConfig);
+            await Task.Delay(1);
 
             #endregion Config
 
             #region Trigger Bot
 
             uiManager.AT_TriggerBot = AddTitle(TriggerBot, "Auto Trigger", true);
+            await Task.Delay(1);
             uiManager.T_AutoTrigger = AddToggle(TriggerBot, "Auto Trigger");
+            await Task.Delay(1);
             uiManager.S_AutoTriggerDelay = AddSlider(TriggerBot, "Auto Trigger Delay", "Seconds", 0.01, 0.1, 0.01, 1);
+            await Task.Delay(1);
             AddSeparator(TriggerBot);
+            await Task.Delay(1);
 
             #endregion Trigger Bot
 
             #region FOV Config
 
             uiManager.AT_FOV = AddTitle(FOVConfig, "FOV Config", true);
+            await Task.Delay(1);
             uiManager.T_FOV = AddToggle(FOVConfig, "FOV");
+            await Task.Delay(1);
             uiManager.CC_FOVColor = AddColorChanger(FOVConfig, "FOV Color");
             uiManager.CC_FOVColor.ColorChangingBorder.Background = (Brush)new BrushConverter().ConvertFromString(Dictionary.colorState["FOV Color"]);
             uiManager.CC_FOVColor.Reader.Click += (s, x) =>
@@ -612,6 +870,7 @@ namespace Aimmy2
                     PropertyChanger.PostColor(Color.FromArgb(colorDialog.Color.A, colorDialog.Color.R, colorDialog.Color.G, colorDialog.Color.B));
                 }
             };
+            await Task.Delay(1);
 
             uiManager.S_FOVSize = AddSlider(FOVConfig, "FOV Size", "Size", 1, 1, 10, 640);
             uiManager.S_FOVSize.Slider.ValueChanged += (s, x) =>
@@ -620,6 +879,7 @@ namespace Aimmy2
                 ActualFOV = FovSize;
                 PropertyChanger.PostNewFOVSize(ActualFOV);
             };
+            await Task.Delay(1);
             uiManager.S_EMASmoothing.Slider.ValueChanged += (s, x) =>
             {
                 if (Dictionary.toggleState["EMA Smoothening"])
@@ -629,16 +889,22 @@ namespace Aimmy2
                 }
             };
             AddSeparator(FOVConfig);
+            await Task.Delay(1);
 
             #endregion FOV Config
 
             #region ESP Config
 
             uiManager.AT_DetectedPlayer = AddTitle(ESPConfig, "ESP Config", true);
+            await Task.Delay(1);
             uiManager.T_ShowDetectedPlayer = AddToggle(ESPConfig, "Show Detected Player");
+            await Task.Delay(1);
             uiManager.T_ShowAIConfidence = AddToggle(ESPConfig, "Show AI Confidence");
+            await Task.Delay(1);
             uiManager.T_ShowTracers = AddToggle(ESPConfig, "Show Tracers");
+            await Task.Delay(1);
             uiManager.T_ShowFPS = AddToggle(ESPConfig, "Show FPS");
+            await Task.Delay(1);
             uiManager.CC_DetectedPlayerColor = AddColorChanger(ESPConfig, "Detected Player Color");
             uiManager.CC_DetectedPlayerColor.ColorChangingBorder.Background = (Brush)new BrushConverter().ConvertFromString(Dictionary.colorState["Detected Player Color"]);
             uiManager.CC_DetectedPlayerColor.Reader.Click += (s, x) =>
@@ -651,31 +917,42 @@ namespace Aimmy2
                     PropertyChanger.PostDPColor(Color.FromArgb(colorDialog.Color.A, colorDialog.Color.R, colorDialog.Color.G, colorDialog.Color.B));
                 }
             };
+            await Task.Delay(1);
 
             uiManager.S_DPFontSize = AddSlider(ESPConfig, "AI Confidence Font Size", "Size", 1, 1, 1, 30);
             uiManager.S_DPFontSize.Slider.ValueChanged += (s, x) => PropertyChanger.PostDPFontSize((int)uiManager.S_DPFontSize.Slider.Value);
+            await Task.Delay(1);
 
             uiManager.S_DPCornerRadius = AddSlider(ESPConfig, "Corner Radius", "Radius", 1, 1, 0, 100);
             uiManager.S_DPCornerRadius.Slider.ValueChanged += (s, x) => PropertyChanger.PostDPWCornerRadius((int)uiManager.S_DPCornerRadius.Slider.Value);
+            await Task.Delay(1);
 
             uiManager.S_DPBorderThickness = AddSlider(ESPConfig, "Border Thickness", "Thickness", 0.1, 1, 0.1, 10);
             uiManager.S_DPBorderThickness.Slider.ValueChanged += (s, x) => PropertyChanger.PostDPWBorderThickness(uiManager.S_DPBorderThickness.Slider.Value);
+            await Task.Delay(1);
 
             uiManager.S_DPOpacity = AddSlider(ESPConfig, "Opacity", "Opacity", 0.1, 0.1, 0, 1);
+            await Task.Delay(1);
 
             AddSeparator(ESPConfig);
+            await Task.Delay(1);
 
             #endregion ESP Config
         }
 
-        private void LoadSettingsMenu()
+        private async Task LoadSettingsMenuAsync()
         {
             uiManager.AT_SettingsMenu = AddTitle(SettingsConfig, "Settings Menu", true);
+            await Task.Delay(1);
 
             uiManager.D_MouseMovementMethod = AddDropdown(SettingsConfig, "Mouse Movement Method");
+            await Task.Delay(1);
             AddDropdownItem(uiManager.D_MouseMovementMethod, "Mouse Event");
+            await Task.Delay(1);
             AddDropdownItem(uiManager.D_MouseMovementMethod, "SendInput");
+            await Task.Delay(1);
             uiManager.DDI_LGHUB = AddDropdownItem(uiManager.D_MouseMovementMethod, "LG HUB");
+            await Task.Delay(1);
 
             uiManager.DDI_LGHUB.Selected += (sender, e) =>
             {
@@ -686,6 +963,7 @@ namespace Aimmy2
             };
 
             uiManager.DDI_RazerSynapse = AddDropdownItem(uiManager.D_MouseMovementMethod, "Razer Synapse (Requires Razer Peripheral)");
+            await Task.Delay(1);
             uiManager.DDI_RazerSynapse.Selected += async (sender, e) =>
             {
                 if (!await RZMouse.Load())
@@ -695,84 +973,98 @@ namespace Aimmy2
             };
 
             uiManager.D_ExecutionProvider = AddDropdown(SettingsConfig, "Execution Provider Type");
+            await Task.Delay(1);
             uiManager.DDI_CUDA = AddDropdownItem(uiManager.D_ExecutionProvider, "CUDA");
+            await Task.Delay(1);
             uiManager.DDI_TensorRT = AddDropdownItem(uiManager.D_ExecutionProvider, "TensorRT");
-
-
-
+            await Task.Delay(1);
 
             //uiManager.D_MonitorSelection = AddDropdown(SettingsConfig, "Monitor Selection");
 
             uiManager.D_ScreenCaptureMethod = AddDropdown(SettingsConfig, "Screen Capture Method");
+            await Task.Delay(1);
             AddDropdownItem(uiManager.D_ScreenCaptureMethod, "DirectX");
+            await Task.Delay(1);
 
             AddDropdownItem(uiManager.D_ScreenCaptureMethod, "GDI");
+            await Task.Delay(1);
 
             uiManager.T_CollectDataWhilePlaying = AddToggle(SettingsConfig, "Collect Data While Playing");
+            await Task.Delay(1);
             uiManager.T_AutoLabelData = AddToggle(SettingsConfig, "Auto Label Data");
+            await Task.Delay(1);
 
             uiManager.T_MouseBackgroundEffect = AddToggle(SettingsConfig, "Mouse Background Effect");
+            await Task.Delay(1);
             uiManager.T_UITopMost = AddToggle(SettingsConfig, "UI TopMost");
+            await Task.Delay(1);
             uiManager.T_DebugMode = AddToggle(SettingsConfig, "Debug Mode");
+            await Task.Delay(1);
             uiManager.B_SaveConfig = AddButton(SettingsConfig, "Save Config");
             uiManager.B_SaveConfig.Reader.Click += (s, e) => new ConfigSaver().ShowDialog();
+            await Task.Delay(1);
 
             AddSeparator(SettingsConfig);
+            await Task.Delay(1);
 
             uiManager.AT_XYPercentageAdjustmentEnabler = AddTitle(XYPercentageEnablerMenu, "X/Y Percentage Adjustment", true);
+            await Task.Delay(1);
             uiManager.T_XAxisPercentageAdjustment = AddToggle(XYPercentageEnablerMenu, "X Axis Percentage Adjustment");
+            await Task.Delay(1);
             uiManager.T_YAxisPercentageAdjustment = AddToggle(XYPercentageEnablerMenu, "Y Axis Percentage Adjustment");
+            await Task.Delay(1);
 
             uiManager.T_XAxisPercentageAdjustment.Reader.Click += (s, e) => VisibilityXY();
             uiManager.T_YAxisPercentageAdjustment.Reader.Click += (s, e) => VisibilityXY();
 
             AddSeparator(XYPercentageEnablerMenu);
+            await Task.Delay(1);
+
+            LoadSettingsDropdownStates();
+            uiManager.DDI_TensorRT.Selected += OnExecutionProviderSelected;
+            uiManager.DDI_CUDA.Selected += OnExecutionProviderSelected;
         }
 
-        private void LoadCreditsMenu()
+        private async Task LoadCreditsMenuAsync()
         {
             AddTitle(CreditsPanel, "Developers");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Booby", "This Entire Repo");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Taylor", "Original Repo");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Babyhamsta", "AI Logic");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "MarsQQ - #1 OF Model", "Design");
+            await Task.Delay(1);
             AddSeparator(CreditsPanel);
+            await Task.Delay(1);
 
             AddTitle(CreditsPanel, "Contributors");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "whoswhip", "Bug fixes & EMA");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "HakaCat", "Idea for Auto Labelling Data");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Themida - Sexy Man", "LGHub check");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Ninja - Booby", "MarsQQ's emotional support");
+            await Task.Delay(1);
             AddSeparator(CreditsPanel);
+            await Task.Delay(1);
 
             AddTitle(CreditsPanel, "Model Creators");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Babyhamsta", "UniversalV4, Phantom Forces");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Natdog400", "AIO V2, V7");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Themida - Sexy Man", "Arsenal, Strucid, Bad Business, Blade Ball, etc.");
+            await Task.Delay(1);
             AddCredit(CreditsPanel, "Hogthewog", "Da Hood, FN, etc.");
+            await Task.Delay(1);
             AddSeparator(CreditsPanel);
-        }
-
-        public async Task LoadStoreMenu()
-        {
-            try
-            {
-                Task models = FileManager.RetrieveAndAddFiles("https://api.github.com/repos/Babyhamsta/Aimmy/contents/models", "bin\\models", AvailableModels);
-                Task configs = FileManager.RetrieveAndAddFiles("https://api.github.com/repos/Babyhamsta/Aimmy/contents/configs", "bin\\configs", AvailableConfigs);
-
-                await Task.WhenAll(models, configs);
-            }
-            catch (Exception e)
-            {
-                FileManager.LogError("Error loading store menu: " + e, true, 10000);
-                return;
-            }
-
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                DownloadGateway(ModelStoreScroller, AvailableModels, "models");
-                DownloadGateway(ConfigStoreScroller, AvailableConfigs, "configs");
-            });
+            await Task.Delay(1);
         }
 
         private void DownloadGateway(StackPanel Scroller, HashSet<string> entries, string folder)
@@ -893,7 +1185,7 @@ namespace Aimmy2
 
         private void OpenFolderB_Click(object sender, RoutedEventArgs e)
         {
-            if (sender is Button clickedButton && clickedButton.Tag != null)
+            if (sender is System.Windows.Controls.Button clickedButton && clickedButton.Tag != null)
             {
                 string folderPath = Path.Combine(Directory.GetCurrentDirectory(), "bin", clickedButton.Tag.ToString());
                 if (Directory.Exists(folderPath))

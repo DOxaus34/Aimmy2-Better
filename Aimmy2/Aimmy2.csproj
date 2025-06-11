@@ -72,12 +72,25 @@
     </PackageReference>
     <PackageReference Include="MaterialDesignThemes" Version="5.2.1" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.21.0" />
+    <PackageReference Include="Microsoft.Windows.CsWin32" Version="0.3.183">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
     <PackageReference Include="MouseKeyHook" Version="5.7.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="PixiEditor.ColorPicker" Version="3.4.1" />
+    <PackageReference Include="PixiEditor.ColorPicker.Models" Version="1.0.7" />
     <PackageReference Include="Supercluster.KDTree" Version="1.0.4" />
     <PackageReference Include="System.Management" Version="9.0.3" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.6.2" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.6.2" />
     <PackageReference Include="XamlRadialProgressBar" Version="1.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="AILogic\Convert.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 	<ItemGroup>
@@ -120,5 +133,15 @@
 	    <SubType>Code</SubType>
 	  </Compile>
 	</ItemGroup>
+
+  <PropertyGroup>
+      <WindowsSdkBinPath Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\')">C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\</WindowsSdkBinPath>
+      <WindowsSdkBinPath Condition="!Exists('C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\') and Exists('C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\')">C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\</WindowsSdkBinPath>
+      <!-- Add more fallbacks if needed -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Page Include="App.xaml"/>
+  </ItemGroup>
 
 </Project>

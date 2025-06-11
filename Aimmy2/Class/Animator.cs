@@ -10,7 +10,7 @@ namespace Aimmy2.Class
         private static TimeSpan duration = TimeSpan.FromMilliseconds(500);
         //private static TimeSpan duration2 = TimeSpan.FromMilliseconds(1000);
 
-        private static readonly IEasingFunction Smooth = new QuarticEase
+        internal static readonly IEasingFunction Smooth = new CubicEase
         {
             EasingMode = EasingMode.EaseInOut
         };
@@ -22,6 +22,7 @@ namespace Aimmy2.Class
                 From = 0.0,
                 To = 1.0,
                 Duration = new Duration(duration),
+                EasingFunction = Smooth
             };
             Storyboard.SetTarget(FadeIn, Object);
             Storyboard.SetTargetProperty(FadeIn, new PropertyPath("Opacity", 1));
@@ -37,6 +38,7 @@ namespace Aimmy2.Class
                 From = 1.0,
                 To = 0.0,
                 Duration = new Duration(duration),
+                EasingFunction = Smooth
             };
             Storyboard.SetTarget(Fade, Object);
             Storyboard.SetTargetProperty(Fade, new PropertyPath("Opacity", 1));
@@ -67,7 +69,7 @@ namespace Aimmy2.Class
             doubleanimation.From = new double?(OriginalSize);
             doubleanimation.To = new double?(NewSize);
             doubleanimation.Duration = speed;
-            doubleanimation.EasingFunction = new QuarticEase();
+            doubleanimation.EasingFunction = Smooth;
             Circle.BeginAnimation(FrameworkElement.WidthProperty, doubleanimation); ;
         }
 
@@ -77,7 +79,7 @@ namespace Aimmy2.Class
             doubleanimation.From = new double?(OriginalSize);
             doubleanimation.To = new double?(NewSize);
             doubleanimation.Duration = speed;
-            doubleanimation.EasingFunction = new QuarticEase();
+            doubleanimation.EasingFunction = Smooth;
             Circle.BeginAnimation(FrameworkElement.HeightProperty, doubleanimation); ;
         }
     }

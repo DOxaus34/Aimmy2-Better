@@ -2,6 +2,7 @@
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Forms;
 using Aimmy2.Class;
@@ -12,9 +13,9 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Microsoft.Win32;
 using SharpGen.Runtime;
-using Supercluster.KDTree;
 using Visuality;
 using Vortice;
+using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -28,26 +29,31 @@ namespace Aimmy2.AILogic
     {
         #region Variables
 
-        private const int IMAGE_SIZE = 640;
-        private const int NUM_DETECTIONS = 8400;
+        private const int IMAGE_SIZE = 320;
+        private const int NUM_DETECTIONS = 2100;
 
-        private DateTime lastSavedTime = DateTime.MinValue;
         private List<string>? _outputNames;
-        private RectangleF LastDetectionBox;
-
-        // Preallocate once for IMAGE_SIZE×IMAGE_SIZE RGB input
-        private readonly float[] _inputBuffer = new float[3 * IMAGE_SIZE * IMAGE_SIZE];
         private readonly DenseTensor<float> _inputTensor;
         private readonly List<NamedOnnxValue> _inputContainer;
 
+        // Preallocate once for IMAGE_SIZE×IMAGE_SIZE RGB input
+        private readonly float[] _inputBuffer = new float[3 * IMAGE_SIZE * IMAGE_SIZE];
 
         private ID3D11Device _device;
         private ID3D11DeviceContext _context;
         private IDXGIOutputDuplication _outputDuplication;
-        private ID3D11Texture2D _desktopImage;
+        private ID3D11Texture2D _stagingTexture;
 
-        private Bitmap? _captureBitmap;
+        // Compute Shader Resources
+        private ID3D11ComputeShader _computeShader;
+        private ID3D11Texture2D _computeInputTexture;
+        private ID3D11ShaderResourceView _computeInputSRV;
+        private ID3D11Buffer _computeOutputBuffer;
+        private ID3D11UnorderedAccessView _computeOutputUAV;
+        private ID3D11Buffer[] _computeStagingBuffers;
+        private int _d3dFrameIndex = 0;
 
+        private bool _computeShaderHasRunOnce = false;
         private int ScreenWidth = WinAPICaller.ScreenWidth;
         private int ScreenHeight = WinAPICaller.ScreenHeight;
 
@@ -61,18 +67,22 @@ namespace Aimmy2.AILogic
         private double[] frameTimes = new double[MAXSAMPLES];
         private int frameTimeIndex = 0;
         private double totalFrameTime = 0;
+        private readonly Stopwatch _uiUpdateTimer = new Stopwatch();
+        private const int UI_UPDATE_RATE = 60; // FPS
+        private readonly TimeSpan _uiUpdateInterval = TimeSpan.FromSeconds(1.0 / UI_UPDATE_RATE);
 
-        private double CenterXTranslated = 0;
-        private double CenterYTranslated = 0;
-
-        private int iterationCount = 0;
         private long totalTime = 0;
-
+        private int iterationCount = 0;
         private int detectedX { get; set; }
         private int detectedY { get; set; }
 
         public double AIConf = 0;
         private static int targetX, targetY;
+
+        private KalmanFilter? _kalmanFilter;
+        private Prediction? _lastPrediction;
+
+        private readonly Prediction _reusablePrediction = new Prediction();
 
         #endregion Variables
 
@@ -88,23 +98,16 @@ namespace Aimmy2.AILogic
                 ExecutionMode = ExecutionMode.ORT_PARALLEL,
                 IntraOpNumThreads = Environment.ProcessorCount
             };
+
             _inputTensor = new DenseTensor<float>(_inputBuffer, new[] { 1, 3, IMAGE_SIZE, IMAGE_SIZE });
             _inputContainer = new List<NamedOnnxValue>
-    {
-        NamedOnnxValue.CreateFromTensor("images", _inputTensor)
-    };
+            {
+                NamedOnnxValue.CreateFromTensor("images", _inputTensor)
+            };
 
             SystemEvents.DisplaySettingsChanged += (s, e) =>
             {
-                if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
-                {
-                    ReinitializeD3D11();
-                }
-                else
-                {
-                    _captureBitmap?.Dispose();
-                    _captureBitmap = null;
-                }
+                ReinitializeD3D11();
             };
 
             // Attempt to load via CUDA (else fallback to CPU)
@@ -113,10 +116,7 @@ namespace Aimmy2.AILogic
                 _ = InitializeModel(sessionOptions, modelPath);
             });
 
-            if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
-            {
-                InitializeDirectX();
-            }
+            InitializeDirectX();
         }
         #region DirectX
         private void InitializeDirectX()
@@ -127,17 +127,9 @@ namespace Aimmy2.AILogic
 
                 // Initialize Direct3D11 device and context
                 FeatureLevel[] featureLevels = new[]
-                   {
-                        FeatureLevel.Level_12_1,
-                        FeatureLevel.Level_12_0,
-                        FeatureLevel.Level_11_1,
-                        FeatureLevel.Level_11_0,
-                        FeatureLevel.Level_10_1,
-                        FeatureLevel.Level_10_0,
-                        FeatureLevel.Level_9_3,
-                        FeatureLevel.Level_9_2,
-                        FeatureLevel.Level_9_1
-                    };
+                {
+                    FeatureLevel.Level_11_0,
+                };
                 var result = D3D11.D3D11CreateDevice(
                     null,
                     DriverType.Hardware,
@@ -146,10 +138,100 @@ namespace Aimmy2.AILogic
                     out _device,
                     out _context
                 );
-                if (result != Result.Ok || _device == null || _context == null)
+                if (result.Failure)
                 {
                     throw new InvalidOperationException($"Failed to create Direct3D11 device or context. HRESULT: {result}");
                 }
+
+                // Create the staging texture for CPU-based processing (fallback/debug)
+                var stagingDesc = new Texture2DDescription
+                {
+                    Width = IMAGE_SIZE,
+                    Height = IMAGE_SIZE,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.B8G8R8A8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Staging,
+                    BindFlags = BindFlags.None,
+                    CPUAccessFlags = CpuAccessFlags.Read,
+                    MiscFlags = ResourceOptionFlags.None
+                };
+                _stagingTexture = _device.CreateTexture2D(stagingDesc);
+
+                // --- Compute Shader Setup ---
+                // 1. Load and compile the shader from the source file
+                try
+                {
+                    const string shaderFileName = "AILogic/Convert.hlsl";
+                    string shaderSource = File.ReadAllText(shaderFileName);
+
+                    // Compile the shader using the correct method signature.
+                    var shaderBytecode = Compiler.Compile(
+                        shaderSource,
+                        "main",
+                        shaderFileName,
+                        "cs_5_0",
+                        ShaderFlags.OptimizationLevel3
+                    );
+
+                    _computeShader = _device.CreateComputeShader(shaderBytecode.Span);
+                    FileManager.LogInfo("Compute shader compiled successfully from source.");
+                }
+                catch (Exception ex)
+                {
+                    // Catch file not found, SharpGenException from compilation, etc.
+                    throw new InvalidOperationException($"Failed to initialize compute shader: {ex.Message}", ex);
+                }
+
+                // 2. Create input texture, which we will copy the screen region to
+                var computeInputDesc = new Texture2DDescription
+                {
+                    Width = IMAGE_SIZE,
+                    Height = IMAGE_SIZE,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.B8G8R8A8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.ShaderResource,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                    MiscFlags = ResourceOptionFlags.None
+                };
+                _computeInputTexture = _device.CreateTexture2D(computeInputDesc);
+                _computeInputSRV = _device.CreateShaderResourceView(_computeInputTexture);
+
+
+                // 3. Create the output buffer on the GPU
+                int bufferSize = 3 * IMAGE_SIZE * IMAGE_SIZE * sizeof(float);
+                var computeOutputDesc = new BufferDescription
+                {
+                    ByteWidth = (uint)bufferSize,
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                    MiscFlags = ResourceOptionFlags.BufferStructured,
+                    StructureByteStride = (uint)sizeof(float)
+                };
+                _computeOutputBuffer = _device.CreateBuffer(computeOutputDesc);
+                _computeOutputUAV = _device.CreateUnorderedAccessView(_computeOutputBuffer);
+
+                // 4. Create a staging buffer on the CPU to read the results back
+                var stagingBufferDesc = new BufferDescription
+                {
+                    ByteWidth = (uint)bufferSize,
+                    Usage = ResourceUsage.Staging,
+                    BindFlags = BindFlags.None,
+                    CPUAccessFlags = CpuAccessFlags.Read,
+                };
+                
+                // Create two staging buffers for pipelining to avoid GPU stalls
+                _computeStagingBuffers = new ID3D11Buffer[2];
+                for (int i = 0; i < _computeStagingBuffers.Length; i++)
+                {
+                    _computeStagingBuffers[i] = _device.CreateBuffer(stagingBufferDesc);
+                }
+                // --- End Compute Shader Setup ---
+
 
                 using var dxgiDevice = _device.QueryInterface<IDXGIDevice>();
                 using var adapterForOutput = dxgiDevice.GetAdapter();
@@ -283,7 +365,6 @@ namespace Aimmy2.AILogic
             }
 
             // Begin the loop
-            // Begin the loop
             _isAiLoopRunning = true;
             _aiLoopThread = new Thread(AiLoop);
             // ↓ ensure COM-based backends (LG HUB, etc.) work without crashing:
@@ -291,7 +372,6 @@ namespace Aimmy2.AILogic
             _aiLoopThread.IsBackground = true;
             _aiLoopThread.Priority = ThreadPriority.AboveNormal;
             _aiLoopThread.Start();
-
 
             return Task.CompletedTask;
         }
@@ -333,11 +413,10 @@ namespace Aimmy2.AILogic
             DetectedPlayerWindow? DetectedPlayerOverlay = Dictionary.DetectedPlayerOverlay;
 
             stopwatch.Start();
+            _uiUpdateTimer.Start();
             int fpsUpdateCounter = 0;
             const int fpsUpdateInterval = 10;
 
-            float scaleX = ScreenWidth / (float)IMAGE_SIZE;
-            float scaleY = ScreenHeight / (float)IMAGE_SIZE;
             while (_isAiLoopRunning)
             {
                 double frameTime = stopwatch.Elapsed.TotalSeconds;
@@ -359,8 +438,6 @@ namespace Aimmy2.AILogic
                     }
                 }
 
-                _ = UpdateFOV();
-
                 if (iterationCount == 1000 && Dictionary.toggleState["Debug Mode"])
                 {
                     double averageTime = totalTime / 1000.0;
@@ -368,22 +445,66 @@ namespace Aimmy2.AILogic
                     totalTime = 0;
                     iterationCount = 0;
                 }
-
+                
                 if (ShouldProcess() && ShouldPredict())
                 {
-                    var closestPredictionTask = Task.Run(() => GetClosestPrediction());
-                    var closestPrediction = await closestPredictionTask.ConfigureAwait(false);
+                    var closestPrediction = GetClosestPrediction();
                     if (closestPrediction == null)
                     {
-                        DisableOverlay(DetectedPlayerOverlay!);
+                        if (_uiUpdateTimer.Elapsed > _uiUpdateInterval)
+                        {
+                            DisableOverlay(DetectedPlayerOverlay!);
+                            _uiUpdateTimer.Restart(); // Reset timer after updating
+                        }
+                        _kalmanFilter = null; // Reset filter when target is lost
+                        _lastPrediction = null;
                         continue;
                     }
 
+                    // --- Kalman Filter Prediction ---
+                    PointF predictedPoint;
+                    if (_kalmanFilter == null || IsNewTarget(closestPrediction))
+                    {
+                        // Initialize or reset the filter for a new target
+                        _kalmanFilter = new KalmanFilter(initialState: closestPrediction.GetCenter());
+                        predictedPoint = closestPrediction.GetCenter();
+                    }
+                    else
+                    {
+                        _kalmanFilter.Predict();
+                        predictedPoint = _kalmanFilter.GetPredictedPosition();
+                    }
+
+                    // Update the filter with the current measurement
+                    _kalmanFilter.Correct(closestPrediction.GetCenter());
+                    // --- End Kalman Filter ---
+
                     _ = AutoTrigger();
 
-                    CalculateCoordinates(DetectedPlayerOverlay!, closestPrediction, scaleX, scaleY);
+                    // Aim coordinates should be calculated every frame for responsiveness.
+                    // Use the PREDICTED point for calculations
+                    CalculateAimCoordinates(closestPrediction, predictedPoint);
+
+                    // But the visual overlay update is throttled.
+                    if (_uiUpdateTimer.Elapsed > _uiUpdateInterval)
+                    {
+                        _ = UpdateFOV();
+                        
+                        if (Dictionary.toggleState["Show Detected Player"] && DetectedPlayerOverlay != null)
+                        {
+                            UpdateOverlay(DetectedPlayerOverlay, closestPrediction.Rectangle, closestPrediction.Confidence);
+                        }
+                        _uiUpdateTimer.Restart(); // Reset timer after updating
+                    }
 
                     HandleAim(closestPrediction);
+                    
+                    if (_lastPrediction == null)
+                    {
+                        _lastPrediction = new Prediction();
+                    }
+                    _lastPrediction.Rectangle = closestPrediction.Rectangle;
+                    _lastPrediction.Confidence = closestPrediction.Confidence;
 
                     totalTime += stopwatch.ElapsedMilliseconds;
                     iterationCount++;
@@ -441,15 +562,17 @@ namespace Aimmy2.AILogic
             });
         }
 
-        private void UpdateOverlay(DetectedPlayerWindow detectedPlayerOverlay)
+        private void UpdateOverlay(DetectedPlayerWindow detectedPlayerOverlay, RectangleF detectionBox, float confidence)
         {
+            AIConf = confidence;
+
             double scalingFactorX = WinAPICaller.scalingFactorX;
             double scalingFactorY = WinAPICaller.scalingFactorY;
 
-            double centerX = LastDetectionBox.X / scalingFactorX + (LastDetectionBox.Width / 2.0);
-            double centerY = LastDetectionBox.Y / scalingFactorY;
-            double boxWidth = LastDetectionBox.Width;
-            double boxHeight = LastDetectionBox.Height;
+            double centerX = detectionBox.X / scalingFactorX + (detectionBox.Width / 2.0);
+            double centerY = detectionBox.Y / scalingFactorY;
+            double boxWidth = detectionBox.Width;
+            double boxHeight = detectionBox.Height;
 
             Application.Current.Dispatcher.InvokeAsync(() =>
             {
@@ -503,56 +626,52 @@ namespace Aimmy2.AILogic
         }
         #endregion
         #region Coordinates
-        private void CalculateCoordinates(DetectedPlayerWindow detectedPlayerOverlay, Prediction closestPrediction, float scaleX, float scaleY)
+        private void CalculateAimCoordinates(Prediction closestPrediction, PointF targetPoint)
         {
-            // Store latest confidence
-            AIConf = closestPrediction.Confidence;
-
-            // If ESP is on, update the overlay—but bail out if Aim Assist is off
-            if (Dictionary.toggleState["Show Detected Player"] && Dictionary.DetectedPlayerOverlay != null)
-            {
-                UpdateOverlay(detectedPlayerOverlay);
-                if (!Dictionary.toggleState["Aim Assist"])
+            if (!Dictionary.toggleState["Aim Assist"])
                     return;
-            }
 
-            // The model’s Rectangle is already in absolute screen pixels
+            // The model's Rectangle is already in absolute screen pixels
             var rect = closestPrediction.Rectangle;
 
-            // Read user‐configured offsets
+            // Read user-configured offsets
             double xOffset = Dictionary.sliderSettings["X Offset (Left/Right)"];
             double yOffset = Dictionary.sliderSettings["Y Offset (Up/Down)"];
             double xOffsetPercent = Dictionary.sliderSettings["X Offset (%)"];
             double yOffsetPercent = Dictionary.sliderSettings["Y Offset (%)"];
 
+            // NOTE: The core calculation now uses the predicted 'targetPoint'
+            // instead of deriving from the prediction's rectangle.
+            // However, the rectangle width/height is still needed for percentage-based offsets.
+
             // Compute the target X in screen pixels
             double x;
             if (Dictionary.toggleState["X Axis Percentage Adjustment"])
-                x = rect.X + rect.Width * (xOffsetPercent / 100.0) + xOffset;
+                x = targetPoint.X - (rect.Width / 2) + rect.Width * (xOffsetPercent / 100.0) + xOffset;
             else
-                x = rect.X + rect.Width / 2.0 + xOffset;
+                x = targetPoint.X + xOffset;
 
             // Compute the target Y in screen pixels
             double y;
             if (Dictionary.toggleState["Y Axis Percentage Adjustment"])
             {
-                // From bottom of box up by a percentage
-                y = rect.Y + rect.Height - rect.Height * (yOffsetPercent / 100.0) + yOffset;
+                // From bottom of box up by a percentage, based on predicted center
+                y = targetPoint.Y + (rect.Height / 2) - rect.Height * (yOffsetPercent / 100.0) + yOffset;
             }
             else
             {
-                // Anchor at Top, Center, or Bottom of the box
+                // Anchor at Top, Center, or Bottom of the box, relative to predicted center
                 string alignment = Dictionary.dropdownState["Aiming Boundaries Alignment"];
                 double anchorFraction = alignment switch
                 {
-                    "Center" => 0.5,
-                    "Bottom" => 1.0,
-                    _ => 0.0   // “Top” or any other value
+                    "Center" => 0.0, // Center of the predicted point
+                    "Bottom" => rect.Height / 2.0, // Bottom of the original box, offset from predicted center
+                    _ => -rect.Height / 2.0   // "Top" or any other value
                 };
-                y = rect.Y + rect.Height * anchorFraction + yOffset;
+                y = targetPoint.Y + anchorFraction + yOffset;
             }
 
-            // Round to integer mouse‐move targets
+            // Round to integer mouse-move targets
             detectedX = (int)Math.Round(x);
             detectedY = (int)Math.Round(y);
         }
@@ -583,10 +702,23 @@ namespace Aimmy2.AILogic
             return new Rectangle(x, y, width, height);
         }
 
-
-        private Task<Prediction?> GetClosestPrediction(bool useMousePosition = true)
+        private bool IsNewTarget(Prediction currentPrediction)
         {
-            // ── 1  Define the crop rectangle (640×640 centred on mouse or screen) ──
+            if (_lastPrediction == null) return true;
+
+            const float maxDistance = 100.0f; // Max pixels a target can move between frames
+            var lastCenter = _lastPrediction.GetCenter();
+            var currentCenter = currentPrediction.GetCenter();
+
+            float dx = lastCenter.X - currentCenter.X;
+            float dy = lastCenter.Y - currentCenter.Y;
+
+            return (dx * dx + dy * dy) > (maxDistance * maxDistance);
+        }
+
+        private Prediction? GetClosestPrediction(bool useMousePosition = true)
+        {
+            // ── 1  Define the crop rectangle (640×640 centred on mouse or screen) ──
             var cursor = WinAPICaller.GetCursorPosition();
             targetX = Dictionary.dropdownState["Detection Area Type"] == "Closest to Mouse"
                 ? cursor.X
@@ -603,253 +735,189 @@ namespace Aimmy2.AILogic
             );
             box = ClampRectangle(box, ScreenWidth, ScreenHeight);
 
-           bool captureOk;
-            if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
-            {
-                // D3D11Screen now returns true when the buffer is ready
-                captureOk = D3D11Screen(box);
-            }
-            else
-            {
-                // GDI path – still returns a Bitmap; convert it
-                Bitmap? bmp = GDIScreen(box);
-                captureOk = bmp != null;
-                if (captureOk)
-                    BitmapToFloatArray(bmp!, _inputBuffer);
-            }
+            bool captureOk = D3D11Screen(box);
 
             if (!captureOk || _onnxModel == null)
-                return Task.FromResult<Prediction?>(null);
-            // ── 3  Run inference (tensor & container are pre‑allocated) ────────────
+                return null;
+            // ── 3  Run inference (tensor & container are pre-allocated) ────────────
             using var results = _onnxModel.Run(_inputContainer, _outputNames, _modeloptions);
             var output = results[0].AsTensor<float>();
-            // ── 4  Filter by FOV and confidence, collect surviving boxes ───────────
+
+            // ── 4 & 5: Filter, find, and select the best prediction in a single pass ──
+            if (!FindBestPrediction(output, box, _reusablePrediction))
+                return null;
+
+
+            // ── 6  Translate the rectangle back into absolute screen space ────────
+            _reusablePrediction.Rectangle = new RectangleF(
+                _reusablePrediction.Rectangle.X + box.Left,
+                _reusablePrediction.Rectangle.Y + box.Top,
+                _reusablePrediction.Rectangle.Width,
+                _reusablePrediction.Rectangle.Height
+            );
+
+            return _reusablePrediction;
+        }
+
+        private bool FindBestPrediction(Tensor<float> output, Rectangle detectionBox, Prediction predictionToFill)
+        {
+            float minConf = (float)Dictionary.sliderSettings["AI Minimum Confidence"] / 100f;
             float fovSize = (float)Dictionary.sliderSettings["FOV Size"];
             float half = (IMAGE_SIZE - fovSize) / 2;
             float fovMinX = half, fovMaxX = half + fovSize;
             float fovMinY = half, fovMaxY = half + fovSize;
 
-            var (pts, preds) = PrepareKDTreeData(output, box, fovMinX, fovMaxX, fovMinY, fovMaxY);
-            if (pts.Count == 0)
-                return Task.FromResult<Prediction?>(null);
-
-            // ── 5  Pick the detection closest to the crop centre ───────────────────
             double centre = IMAGE_SIZE / 2.0;
-            int bestIdx = 0;
+
             double bestDist = double.MaxValue;
-            for (int i = 0; i < pts.Count; i++)
+            bool foundPrediction = false;
+
+            // Get a span of the tensor's data for faster access.
+            // The model output is planar (SoA): [1, 5, 2100], so all xC are contiguous, then all yC, etc.
+            // This memory layout is not ideal for cache locality, but we can at least avoid
+            // the overhead of the multi-dimensional indexer.
+            // We cast to DenseTensor to access the underlying buffer, which should be safe.
+            var outputSpan = (output as DenseTensor<float>)!.Buffer.Span;
+            int numDetections = output.Dimensions[2];
+
+            // Pre-calculate offsets to each data plane
+            int xPlaneOffset = 0 * numDetections;
+            int yPlaneOffset = 1 * numDetections;
+            int wPlaneOffset = 2 * numDetections;
+            int hPlaneOffset = 3 * numDetections;
+            int confPlaneOffset = 4 * numDetections;
+
+            for (int i = 0; i < numDetections; i++)
             {
-                double dx = pts[i][0] - centre;
-                double dy = pts[i][1] - centre;
-                double d2 = dx * dx + dy * dy;
-                if (d2 < bestDist)
-                {
-                    bestDist = d2;
-                    bestIdx = i;
-                }
-            }
-
-            var best = preds[bestIdx];
-
-            // ── 6  Translate the rectangle back into absolute screen space ────────
-            best.Rectangle = new RectangleF(
-                best.Rectangle.X + box.Left,
-                best.Rectangle.Y + box.Top,
-                best.Rectangle.Width,
-                best.Rectangle.Height
-            );
-
-            return Task.FromResult<Prediction?>(best);
-        }
-
-
-
-
-
-
-        private static (List<double[]> points, List<Prediction> preds)
-    PrepareKDTreeData(
-        Tensor<float> output,
-        Rectangle detectionBox,
-        float fovMinX, float fovMaxX,
-        float fovMinY, float fovMaxY)
-        {
-            float minConf = (float)Dictionary.sliderSettings["AI Minimum Confidence"] / 100f;
-            var points = new List<double[]>(NUM_DETECTIONS);
-            var preds = new List<Prediction>(NUM_DETECTIONS);
-
-            for (int i = 0; i < NUM_DETECTIONS; i++)
-            {
-                float conf = output[0, 4, i];
+                float conf = outputSpan[confPlaneOffset + i];
                 if (conf < minConf) continue;
 
-                float xC = output[0, 0, i], yC = output[0, 1, i];
-                float w = output[0, 2, i], h = output[0, 3, i];
+                float xC = outputSpan[xPlaneOffset + i];
+                float yC = outputSpan[yPlaneOffset + i];
+                float w = outputSpan[wPlaneOffset + i];
+                float h = outputSpan[hPlaneOffset + i];
 
                 float xMin = xC - w / 2, xMax = xC + w / 2;
                 float yMin = yC - h / 2, yMax = yC + h / 2;
-                if (xMin < fovMinX || xMax > fovMaxX ||
-                    yMin < fovMinY || yMax > fovMaxY)
+
+                if (xMin < fovMinX || xMax > fovMaxX || yMin < fovMinY || yMax > fovMaxY)
                     continue;
 
-                // <-- FIX: explicitly create a double[] so it matches List<double[]>
-                points.Add(new double[] { xC, yC });
+                // Check distance
+                double dx = xC - centre;
+                double dy = yC - centre;
+                double d2 = dx * dx + dy * dy;
 
-                preds.Add(new Prediction
+                if (d2 < bestDist)
                 {
-                    Rectangle = new RectangleF(xMin, yMin, w, h),
-                    Confidence = conf,
-                    CenterXTranslated = (xC - detectionBox.Left) / IMAGE_SIZE,
-                    CenterYTranslated = (yC - detectionBox.Top) / IMAGE_SIZE
-                });
+                    bestDist = d2;
+                    foundPrediction = true;
+                    predictionToFill.Rectangle = new RectangleF(xMin, yMin, w, h);
+                    predictionToFill.Confidence = conf;
+                }
             }
 
-            return (points, preds);
+            return foundPrediction;
         }
 
         #endregion
         #endregion AI Loop Functions
 
         #region Screen Capture
-        public Bitmap? ScreenGrab(Rectangle detectionBox)
-        {
-            try
-            {
-                if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
-                {
-                    // Fast DX path fills _inputBuffer; we do not materialise a Bitmap.
-                    bool ok = D3D11Screen(detectionBox);
-                    return ok ? null : null;        // keeps signature, avoids compile error
-                }
-                else
-                {
-                    return GDIScreen(detectionBox); // legacy path
-                }
-            }
-            catch (Exception e)
-            {
-                FileManager.LogError("Error capturing screen:" + e);
-                return null;
-            }
-        }
 
-        // --- high‑speed capture that fills _inputBuffer in‑place ---------------
         private bool D3D11Screen(Rectangle box)
         {
             try
             {
-                if (_device == null || _context == null || _outputDuplication == null)
-                    ReinitializeD3D11();
-
-                var hr = _outputDuplication!.AcquireNextFrame(500, out _, out var desktopResource);
-                if (hr != Result.Ok) { _outputDuplication.ReleaseFrame(); return false; }
-
-                using var fullTex = desktopResource.QueryInterface<ID3D11Texture2D>();
-
-                // (Re)create staging tex only if size changed
-                if (_desktopImage == null ||
-                    _desktopImage.Description.Width != box.Width ||
-                    _desktopImage.Description.Height != box.Height)
+                if (_device == null || _context == null || _outputDuplication == null || _stagingTexture == null)
                 {
-                    _desktopImage?.Dispose();
-                    _desktopImage = _device.CreateTexture2D(new Texture2DDescription
-                    {
-                        Width = (uint)box.Width,
-                        Height = (uint)box.Height,
-                        MipLevels = 1,
-                        ArraySize = 1,
-                        Format = Format.B8G8R8A8_UNorm,
-                        SampleDescription = new SampleDescription(1, 0),
-                        Usage = ResourceUsage.Staging,
-                        CPUAccessFlags = CpuAccessFlags.Read,
-                        BindFlags = BindFlags.None
-                    });
+                    ReinitializeD3D11();
+                    if (_device == null || _context == null || _outputDuplication == null || _stagingTexture == null)
+                        return false;
                 }
 
-                _context.CopySubresourceRegion(
-                    _desktopImage, 0, 0, 0, 0,
-                    fullTex, 0,
-                    new Box(box.Left, box.Top, 0, box.Right, box.Bottom, 1)
-                );
+                var hr = _outputDuplication!.AcquireNextFrame(0, out _, out var desktopResource);
+                if (hr.Failure)
+                {
+                    desktopResource?.Dispose();
+                    if (hr.Code != Vortice.DXGI.ResultCode.WaitTimeout.Code)
+                    {
+                        FileManager.LogError($"AcquireNextFrame failed with HRESULT: {hr}");
+                        ReinitializeD3D11();
+                    }
+                    return false;
+                }
 
-                // Map once, convert directly into _inputBuffer
-                var map = _context.Map(_desktopImage, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
-                ConvertBGRA8ToCHWFloat(map, box.Width, box.Height, _inputBuffer);
-                _context.Unmap(_desktopImage, 0);
+                using (desktopResource)
+                {
+                    using var fullTex = desktopResource.QueryInterface<ID3D11Texture2D>();
+                    
+                    // Copy the relevant part of the screen to our input texture
+                    _context.CopySubresourceRegion(
+                        _computeInputTexture, 0, 0, 0, 0,
+                        fullTex, 0,
+                        new Box(box.Left, box.Top, 0, box.Right, box.Bottom, 1)
+                    );
+                }
                 _outputDuplication.ReleaseFrame();
 
-                return true;        // buffer is ready
+                // Run Compute Shader
+                _context.CSSetShader(_computeShader);
+                _context.CSSetShaderResource(0, _computeInputSRV);
+                _context.CSSetUnorderedAccessView(0, _computeOutputUAV);
+                _context.Dispatch(IMAGE_SIZE / 16, IMAGE_SIZE / 16, 1); // 320/16 = 20
+
+                // Unbind resources
+                _context.CSSetShader(null);
+                _context.CSSetShaderResource(0, null);
+                _context.CSSetUnorderedAccessView(0, null);
+                
+                if (!_computeShaderHasRunOnce)
+                {
+                    FileManager.LogInfo("Compute shader executed successfully for the first time.");
+                    _computeShaderHasRunOnce = true;
+                }
+
+                int currentIndex = _d3dFrameIndex % 2;
+                int nextIndex = (_d3dFrameIndex + 1) % 2;
+
+                // Kick off the copy for the current frame's data to its staging buffer.
+                // We will read this data on the *next* frame.
+                _context.CopyResource(_computeStagingBuffers[currentIndex], _computeOutputBuffer);
+
+                // On the first frame, we have nothing to read, so we return.
+                if (_d3dFrameIndex == 0)
+                {
+                    _d3dFrameIndex++;
+                    return false;
+                }
+
+                // --- Read back the data from the PREVIOUS frame ---
+                // This avoids a stall by allowing the CPU to work on old data
+                // while the GPU processes the current frame's copy command.
+                var map = _context.Map(_computeStagingBuffers[nextIndex], 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+                
+                // Copy the data from the mapped pointer to our float array
+                Marshal.Copy(map.DataPointer, _inputBuffer, 0, _inputBuffer.Length);
+
+                _context.Unmap(_computeStagingBuffers[nextIndex], 0);
+
+                _d3dFrameIndex++;
+                return true;
+            }
+            catch (SharpGenException ex) when (ex.ResultCode.Code == Vortice.DXGI.ResultCode.DeviceRemoved.Code || ex.ResultCode.Code == Vortice.DXGI.ResultCode.DeviceReset.Code)
+            {
+                FileManager.LogError("DX11 device was lost: " + ex.Message);
+                ReinitializeD3D11();
+                return false;
             }
             catch (Exception ex)
             {
-                FileManager.LogError("DX11 capture failed: " + ex.Message);
-                ReinitializeD3D11();
+                FileManager.LogError("DX11 capture failed unexpectedly: " + ex.Message);
                 return false;
             }
         }
 
-
-
-
-        private Bitmap GDIScreen(Rectangle detectionBox)
-        {
-            if (detectionBox.Width <= 0 || detectionBox.Height <= 0)
-            {
-                throw new ArgumentException("Detection box dimensions must be greater than zero. (The enemy is too small)");
-            }
-
-            if (_device != null || _context != null || _outputDuplication != null)
-            {
-                FileManager.LogWarning("D3D11 was not properly disposed, disposing now...", true, 1500);
-                DisposeD311();
-            }
-
-            if (_captureBitmap == null || _captureBitmap.Width != detectionBox.Width || _captureBitmap.Height != detectionBox.Height)
-            {
-                _captureBitmap?.Dispose();
-                _captureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height, PixelFormat.Format32bppArgb);
-            }
-
-            try
-            {
-                using (var g = Graphics.FromImage(_captureBitmap))
-                    g.CopyFromScreen(detectionBox.Left, detectionBox.Top, 0, 0, detectionBox.Size, CopyPixelOperation.SourceCopy);
-
-            }
-            catch (Exception ex)
-            {
-                FileManager.LogError($"Failed to capture screen: {ex.Message}");
-                throw;
-            }
-
-            return _captureBitmap;
-        }
-
-
-
-        private void SaveFrame(Bitmap frame, Prediction? DoLabel = null)
-        {
-            if (!Dictionary.toggleState["Collect Data While Playing"] || Dictionary.toggleState["Constant AI Tracking"] || (DateTime.Now - lastSavedTime).TotalMilliseconds < 500) return;
-
-            lastSavedTime = DateTime.Now;
-            string uuid = Guid.NewGuid().ToString();
-
-            string imagePath = Path.Combine("bin", "images", $"{uuid}.jpg");
-            frame.Save(imagePath);
-            if (Dictionary.toggleState["Auto Label Data"] && DoLabel != null)
-            {
-                var labelPath = Path.Combine("bin", "labels", $"{uuid}.txt");
-
-                float x = (DoLabel!.Rectangle.X + DoLabel.Rectangle.Width / 2) / frame.Width;
-                float y = (DoLabel!.Rectangle.Y + DoLabel.Rectangle.Height / 2) / frame.Height;
-                float width = DoLabel.Rectangle.Width / frame.Width;
-                float height = DoLabel.Rectangle.Height / frame.Height;
-
-                File.WriteAllText(labelPath, $"0 {x} {y} {width} {height}");
-            }
-        }
-
-        #region Reinitialization, Clamping, Misc
         public void ReinitializeD3D11()
         {
             try
@@ -864,82 +932,7 @@ namespace Aimmy2.AILogic
                 FileManager.LogError("Error during D3D11 reinitialization: " + ex);
             }
         }
-        #endregion
         #endregion Screen Capture
-
-        #region bitmap and friends
-
-        public static Func<double[], double[], double> L2Norm_Squared_Double = (x, y) =>
-        {
-            double dist = 0f;
-            for (int i = 0; i < x.Length; i++)
-            {
-                dist += (x[i] - y[i]) * (x[i] - y[i]);
-            }
-
-            return dist;
-        };
-
-        public static unsafe void BitmapToFloatArray(Bitmap image, float[] buffer)
-        {
-            int w = image.Width, h = image.Height, px = w * h;
-            var rect = new Rectangle(0, 0, w, h);
-            var bmpData = image.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format16bppRgb555);
-
-            byte* ptr = (byte*)bmpData.Scan0;
-            float mul = 1f / 31f;
-            int stride = bmpData.Stride;
-
-            for (int y = 0; y < h; y++)
-            {
-                byte* row = ptr + y * stride;
-                for (int x = 0; x < w; x++)
-                {
-                    int idx = y * w + x;
-                    ushort pix = (ushort)(row[2 * x] | (row[2 * x + 1] << 8));
-                    buffer[idx] = ((pix >> 10) & 0x1F) * mul;
-                    buffer[px + idx] = ((pix >> 5) & 0x1F) * mul;
-                    buffer[2 * px + idx] = (pix & 0x1F) * mul;
-                }
-            }
-
-            image.UnlockBits(bmpData);
-        }
-
-
-        #endregion complicated math
-
-        /// <summary>Fast BGRA‑8 → CHW float32 normalised 0‑1.</summary>
-        private static unsafe void ConvertBGRA8ToCHWFloat(
-            Vortice.Direct3D11.MappedSubresource src, int width, int height, float[] dst)
-        {
-            byte* pSrc = (byte*)src.DataPointer;
-            int pitch = (int)src.RowPitch;
-            int px = width * height;
-
-            fixed (float* pDst = dst)
-            {
-                float* r = pDst;           // [0 ..  px)
-                float* g = pDst + px;      // [px .. 2px)
-                float* b = pDst + 2 * px;  // [2px.. 3px)
-
-                for (int y = 0; y < height; y++)
-                {
-                    byte* row = pSrc + y * pitch;
-                    for (int x = 0; x < width; x++)
-                    {
-                        int idx = y * width + x;
-                        b[idx] = row[x * 4 + 0] / 255f;   // B
-                        g[idx] = row[x * 4 + 1] / 255f;   // G
-                        r[idx] = row[x * 4 + 2] / 255f;   // R
-                    }
-                }
-            }
-        }
-
-
-
-
 
         public void Dispose()
         {
@@ -947,17 +940,37 @@ namespace Aimmy2.AILogic
             if (_aiLoopThread != null && _aiLoopThread.IsAlive && !_aiLoopThread.Join(TimeSpan.FromSeconds(1)))
             {
                 _aiLoopThread.Interrupt();
-
             }
             DisposeResources();
         }
         private void DisposeD311()
         {
-            _desktopImage?.Dispose();
-            _desktopImage = null;
-
             _outputDuplication?.Dispose();
             _outputDuplication = null;
+            
+            _stagingTexture?.Dispose();
+            _stagingTexture = null;
+
+            // Dispose Compute Shader Resources
+            _computeShader?.Dispose();
+            _computeShader = null;
+            _computeInputTexture?.Dispose();
+            _computeInputTexture = null;
+            _computeInputSRV?.Dispose();
+            _computeInputSRV = null;
+            _computeOutputBuffer?.Dispose();
+            _computeOutputBuffer = null;
+            _computeOutputUAV?.Dispose();
+            _computeOutputUAV = null;
+
+            if (_computeStagingBuffers != null)
+            {
+                foreach (var buffer in _computeStagingBuffers)
+                {
+                    buffer?.Dispose();
+                }
+                _computeStagingBuffers = null;
+            }
 
             _context?.Dispose();
             _context = null;
@@ -967,14 +980,7 @@ namespace Aimmy2.AILogic
         }
         private void DisposeResources()
         {
-            if (Dictionary.dropdownState["Screen Capture Method"] == "DirectX")
-            {
-                DisposeD311();
-            }
-            else
-            {
-                _captureBitmap?.Dispose();
-            }
+            DisposeD311();
 
             _onnxModel?.Dispose();
             _modeloptions?.Dispose();
@@ -984,8 +990,7 @@ namespace Aimmy2.AILogic
         {
             public RectangleF Rectangle { get; set; }
             public float Confidence { get; set; }
-            public float CenterXTranslated { get; set; }
-            public float CenterYTranslated { get; set; }
+            public PointF GetCenter() => new PointF(Rectangle.X + Rectangle.Width / 2, Rectangle.Y + Rectangle.Height / 2);
         }
     }
 }

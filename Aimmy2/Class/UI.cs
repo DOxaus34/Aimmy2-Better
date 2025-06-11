@@ -25,8 +25,13 @@ namespace Aimmy2.Class
         public ComboBoxItem? DDI_ClosestToCenterScreen { get; set; }
         public ADropdown? D_AimingBoundariesAlignment { get; set; }
         public ASlider? S_MouseSensitivity { get; set; }
+        public AToggle? T_BezierCurve { get; set; }
         public ASlider? S_BezierStrength { get; set; }
         public ASlider? S_BezierSteps { get; set; }
+        public AToggle? T_WindMouse { get; set; }
+        public ASlider? S_WindMouseGravity { get; set; }
+        public ASlider? S_WindMouseWindStrength { get; set; }
+        public ASlider? S_WindMouseTargetJitter { get; set; }
         public ASlider? S_MouseJitter { get; set; }
         public ASlider? S_YOffset { get; set; }
         public ASlider? S_YOffsetPercent { get; set; }
